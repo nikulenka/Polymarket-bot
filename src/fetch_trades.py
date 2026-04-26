@@ -12,11 +12,11 @@ def fetch_trades():
         print(f"Файл {csv_path} не найден. Сначала запустите скрипт загрузки рынков.")
         return
 
-    # --- Шаг 1: топ-100 рынков по объёму из trades_raw.csv ---
+    # --- Шаг 1: топ-300 рынков по объёму ---
     df_markets = pd.read_csv(csv_path)
     df_markets["volume_total"] = pd.to_numeric(df_markets["volume_total"], errors="coerce")
-    top100 = df_markets.sort_values("volume_total", ascending=False).head(200)
-    market_ids = top100["market_id"].tolist()
+    top300 = df_markets.sort_values("volume_total", ascending=False).head(300)
+    market_ids = top300["market_id"].tolist()
     print(f"Отобрано рынков для запроса: {len(market_ids)}")
 
     # --- Шаг 2: получаем conditionId через Gamma API ---
@@ -89,6 +89,9 @@ def fetch_trades():
     unique_wallets  = df["wallet"].nunique()
     unique_markets  = df["market_id"].nunique()
     total_vol       = df["size_usdc"].sum()
+    min_time        = df["datetime"].min()
+    max_time        = df["datetime"].max()
+    duration_days   = (max_time - min_time).days
 
     print(f"\n{'='*50}")
     print(f"✓ Файл сохранён: {out}")
@@ -97,6 +100,7 @@ def fetch_trades():
     print(f"  Уникальных кошельков:  {unique_wallets:>10,}")
     print(f"  Рынков охвачено:       {unique_markets:>10,}")
     print(f"  Суммарный объём:       ${total_vol:>12,.2f}")
+    print(f"  Диапазон: {min_time.strftime('%Y-%m-%d')} -> {max_time.strftime('%Y-%m-%d')} ({duration_days} дн.)")
     print(f"{'='*50}")
 
     print(f"\nТоп-3 рынка по числу сделок:")
