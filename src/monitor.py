@@ -17,9 +17,10 @@ POSITIONS_FILE = "data/open_positions.json"
 LOG_DIR        = "logs"
 LOG_FILE       = "logs/signals.log"
 POLL_INTERVAL  = 30    
-SIGNAL_WINDOW  = 1800  
+SIGNAL_WINDOW  = 43200  # 12 часов как в успешном бэктесте
 MIN_WALLETS    = 2     
-MIN_SIZE_USDC  = 500.0   # Повышаем до $500 для монитора китов
+MIN_SIZE_USDC  = 50.0    # Порог для известных китов
+WHALE_MIN_SIZE = 1000.0  # Любая сделка от $1000 = динамический кит
 
 SKIP_PATTERNS = [
     "NBA", "NFL", "NHL", "MLB", "soccer", "win the", 
@@ -178,7 +179,13 @@ def run():
             now_ts = cycle_start.timestamp()
             cutoff = now_ts - SIGNAL_WINDOW
 
-            trades = httpx.get(f"{DATA_API}/trades", params={"limit": 500}, timeout=15).json()
+            # На первом проходе берем больше данных, чтобы наполнить буфер
+            limit = 5000 if not seen_hashes else 500
+            try:
+                resp = httpx.get(f"{DATA_API}/trades", params={"limit": limit}, timeout=15)
+                trades = resp.json()
+            except:
+                print("⚠️ Ошибка сети при получении сделок"); time.sleep(10); continue
             
             for t in trades:
                 tx = t.get("transactionHash", "")
@@ -189,9 +196,16 @@ def run():
                 price = float(t.get("price", 0))
                 size_usdc = float(t.get("size", 0)) * price
                 
-                if wallet in top_wallets and size_usdc >= MIN_SIZE_USDC:
+                # Два критерия: известный кит ИЛИ крупная сделка от кого угодно
+                is_known_whale = wallet in top_wallets and size_usdc >= MIN_SIZE_USDC
+                is_big_trade = size_usdc >= WHALE_MIN_SIZE
+                
+                if is_known_whale or is_big_trade:
+                    ts_raw = int(t.get("timestamp", 0))
+                    ts_sec = ts_raw / 1000 if ts_raw > 1e11 else ts_raw
+                    
                     rolling_buffer.append({
-                        "wallet": wallet, "ts": int(t.get("timestamp", 0)), "size": size_usdc,
+                        "wallet": wallet, "ts": ts_sec, "size": size_usdc,
                         "market": t.get("title", ""), "cond_id": t.get("conditionId", ""), 
                         "side": t.get("side", ""), "price": price, "outcome": t.get("outcome", "")
                     })
