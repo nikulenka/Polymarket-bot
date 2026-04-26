@@ -251,6 +251,10 @@ def run():
                         send_telegram(msg)
                         print(f"\n{msg}\n")
 
+            # Вывод "пульса" в лог
+            ts_label = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            print(f"[{ts_label}] Мониторинг... Сделок в буфере: {len(rolling_buffer)} | Активных позиций: {len(load_positions())}")
+            
             if len(seen_hashes) > 20_000: seen_hashes = set(list(seen_hashes)[-10_000:])
             time.sleep(POLL_INTERVAL)
         except Exception as e:
