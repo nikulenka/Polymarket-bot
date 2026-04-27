@@ -41,9 +41,12 @@ def place_bet(token_id: str, side: str, size_usd: float, price: float):
         print(f"  [!] Размер ордера слишком мал: {token_size} токенов")
         return None
     
-    # Ограничиваем цену максимумом 0.99 и округляем до 4 знаков
-    # Polymarket CLOB не принимает ордера по 1.0 или выше 0.99 на некоторых рынках
-    safe_price = min(0.99, round(price, 4))
+    # Ограничиваем цену максимумом 0.99 и минимумом 0.01 (требование CLOB)
+    safe_price = max(0.01, min(0.99, round(price, 4)))
+    
+    if price < 0.01:
+        print(f"  [!] Цена {price} ниже минимально допустимой (0.01)")
+        return None
     
     print(f"  📋 Ордер: {side} {token_size} токенов @ {safe_price:.4f} (${size_usd:.2f})")
     

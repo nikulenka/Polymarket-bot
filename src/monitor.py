@@ -496,7 +496,7 @@ def run():
                     
                     if trade_price > 0.98:
                         trade_status = f"⏭ Пропущен (цена {trade_price:.4f} слишком высока)"
-                    elif token_id and 0 < trade_price < 1:
+                    elif token_id and 0.01 <= trade_price < 1:
                         action_desc = f"{order_side} (сигнал: {side})"
                         print(f"💰 Открываем сделку {action_desc} на $2: {market_name}")
                         res = place_bet(token_id, order_side, 2.0, trade_price)
