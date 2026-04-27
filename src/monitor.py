@@ -33,7 +33,12 @@ SKIP_PATTERNS = [
     "beat the", "Series", "Finals", "Championship",
     "Buccaneers", "Lakers", "Spurs", "Hawks", "Knicks",
     "Celtics", "Warriors", "Nuggets", "Playoffs",
-    "AM-", "PM-", "AM ET", "PM ET", ":00AM", ":00PM", "Up or Down -"
+    "AM-", "PM-", "AM ET", "PM ET", ":00AM", ":00PM", "Up or Down -",
+    " vs ", " vs. ", " FC ", " United ", " Real ", " City ", " Atletico ",
+    "Madrid Open", "Tennis", "ATP", "WTA", "Winner", "Map 1", "Map 2",
+    "Counter-Strike", "CS2", "Dota", "Esports", "UFC", "MMA", "Boxing",
+    "Total Sets", "O/U 2.5", "O/U 3.5", "O/U 4.5", "Total Goals",
+    "Premier League", "Champions League", "La Liga", "Bundesliga"
 ]
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -206,19 +211,29 @@ def fetch_trades(limit, timeout=15):
 def get_market_tokens(condition_id):
     """Получает tokenIds для исходов. Возвращает dict {outcome_lower: token_id}."""
     try:
-        resp = httpx.get(f"{GAMMA_API}/markets", params={"conditionId": condition_id}, timeout=10)
+        # ВАЖНО: Правильный параметр condition_ids (множественное число)
+        resp = httpx.get(f"{GAMMA_API}/markets", params={"condition_ids": condition_id}, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             if data:
-                m = data[0]
+                # Дополнительная проверка, что мы получили именно тот рынок
+                target_market = None
+                for m in data:
+                    if m.get("conditionId") == condition_id:
+                        target_market = m
+                        break
+                
+                if not target_market:
+                    print(f"  ⚠️ В ответе API не найден рынок с ID {condition_id}")
+                    return None
+                
+                m = target_market
                 tokens_raw = m.get("clobTokenIds")
                 if tokens_raw:
                     tokens = json.loads(tokens_raw)
                     outcomes = json.loads(m.get("outcomes", '["Yes", "No"]'))
-                    # NEW-4: ключи в lower case для case-insensitive маппинга
                     return {outcomes[i].lower(): tokens[i] for i in range(len(tokens))}
             else:
-                # NEW-3: логируем пустой ответ
                 print(f"  ⚠️ Gamma API вернул пустой список для condition_id={condition_id}")
     except Exception as e:
         print(f"  [!] Ошибка получения токенов для {condition_id}: {e}")
@@ -326,17 +341,17 @@ def manage_positions():
                 entry = p.get("entry_price", 0)
                 if entry > 0:
                     change = (current_price - entry) / entry
-                    if change >= 0.15:
-                        print(f"✅ Take Profit +15%: закрываем {p['market']}")
+                    if change >= 0.25:
+                        print(f"✅ Take Profit +25%: закрываем {p['market']}")
                         close_position(token_id, p["tokens"], current_price)
                         to_delete.append(token_id)
-                        send_telegram(f"✅ <b>TAKE PROFIT +15%:</b> {p['market']}\nЦена выхода: {current_price}")
+                        send_telegram(f"✅ <b>TAKE PROFIT +25%:</b> {p['market']}\nЦена выхода: {current_price}")
                         continue
-                    if change <= -0.10:
-                        print(f"🛑 Stop Loss -10%: закрываем {p['market']}")
+                    if change <= -0.20:
+                        print(f"🛑 Stop Loss -20%: закрываем {p['market']}")
                         close_position(token_id, p["tokens"], current_price)
                         to_delete.append(token_id)
-                        send_telegram(f"🛑 <b>STOP LOSS -10%:</b> {p['market']}\nЦена выхода: {current_price}")
+                        send_telegram(f"🛑 <b>STOP LOSS -20%:</b> {p['market']}\nЦена выхода: {current_price}")
                         continue
 
             if now > close_at:
@@ -502,13 +517,21 @@ def run():
                         res = place_bet(token_id, order_side, 2.0, trade_price)
                         if res:
                             trade_status = f"✅ СДЕЛКА: {action_desc}"
+                            # Динамический расчет как в trader.py
+                            MIN_TOKENS = 5.0
+                            entry_usd = 2.0
+                            entry_tokens = entry_usd / trade_price if trade_price > 0 else 0
+                            if entry_tokens < MIN_TOKENS:
+                                entry_tokens = MIN_TOKENS
+                                entry_usd = entry_tokens * trade_price
+                            
                             cached_positions[token_id] = {
                                 "market": market_name,
                                 "side": order_side,
                                 "signal_side": side,
                                 "entry_price": trade_price,
-                                "size_usd": 2.0,
-                                "tokens": 2.0 / trade_price if trade_price > 0 else 0,
+                                "size_usd": entry_usd,
+                                "tokens": entry_tokens,
                                 "opened_at": datetime.now(timezone.utc).isoformat(),
                                 "close_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
                             }
