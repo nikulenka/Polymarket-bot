@@ -1,6 +1,6 @@
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, ApiCreds
 import os
 from dotenv import load_dotenv
 
@@ -9,13 +9,16 @@ load_dotenv()
 MIN_ORDER_SIZE = 0.1  # Минимальный размер ордера в токенах
 
 def get_client():
+    creds = ApiCreds(
+        api_key=os.getenv("POLY_API_KEY"),
+        api_secret=os.getenv("POLY_API_SECRET"),
+        api_passphrase=os.getenv("POLY_API_PASSPHRASE"),
+    )
     return ClobClient(
         host="https://clob.polymarket.com",
         chain_id=POLYGON,
         key=os.getenv("POLY_PRIVATE_KEY"),
-        api_key=os.getenv("POLY_API_KEY"),
-        api_secret=os.getenv("POLY_API_SECRET"),
-        api_passphrase=os.getenv("POLY_API_PASSPHRASE"),
+        creds=creds,
         signature_type=1  # EOA (Standard Wallet)
     )
 
