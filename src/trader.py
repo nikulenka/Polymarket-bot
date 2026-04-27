@@ -19,12 +19,15 @@ def get_client():
     if key and not key.startswith("0x"):
         key = "0x" + key
         
+    proxy_address = os.getenv("POLY_PROXY_ADDRESS")
+    
     return ClobClient(
         host="https://clob.polymarket.com",
         chain_id=POLYGON,
         key=key,
-        creds=creds
-        # signature_type удален, чтобы библиотека использовала EOA по умолчанию
+        creds=creds,
+        signature_type=1 if proxy_address else None,
+        funder=proxy_address if proxy_address else None
     )
 
 def place_bet(token_id: str, side: str, size_usd: float, price: float):

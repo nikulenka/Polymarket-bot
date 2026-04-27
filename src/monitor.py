@@ -159,7 +159,7 @@ def validate_signal_with_claude(sig, market_name):
                 "Content-Type": "application/json",
             },
             json={
-                "model": "anthropic/claude-3-5-haiku-20241022",
+                "model": "anthropic/claude-3.5-haiku",
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=15.0,
