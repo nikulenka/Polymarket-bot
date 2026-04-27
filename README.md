@@ -14,7 +14,7 @@
 
 1. Клонируйте репозиторий:
    ```bash
-   git clone https://github.com/your-username/Polymarket-bot.git
+   git clone https://github.com/nikulenka/Polymarket-bot.git
    cd Polymarket-bot
    ```
 

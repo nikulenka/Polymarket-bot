@@ -159,7 +159,7 @@ def validate_signal_with_claude(sig, market_name):
                 "Content-Type": "application/json",
             },
             json={
-                "model": "anthropic/claude-3.5-haiku",
+                "model": "anthropic/claude-3-5-haiku-20241022",
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=15.0,
@@ -206,7 +206,7 @@ def fetch_trades(limit, timeout=15):
 def get_market_tokens(condition_id):
     """Получает tokenIds для исходов. Возвращает dict {outcome_lower: token_id}."""
     try:
-        resp = httpx.get(f"{GAMMA_API}/markets", params={"condition_id": condition_id}, timeout=10)
+        resp = httpx.get(f"{GAMMA_API}/markets", params={"conditionId": condition_id}, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             if data:
@@ -321,8 +321,25 @@ def manage_positions():
             if close_at.tzinfo is None:
                 close_at = close_at.replace(tzinfo=timezone.utc)
             
+            current_price = get_current_price(token_id)
+            if current_price is not None:
+                entry = p.get("entry_price", 0)
+                if entry > 0:
+                    change = (current_price - entry) / entry
+                    if change >= 0.15:
+                        print(f"✅ Take Profit +15%: закрываем {p['market']}")
+                        close_position(token_id, p["tokens"], current_price)
+                        to_delete.append(token_id)
+                        send_telegram(f"✅ <b>TAKE PROFIT +15%:</b> {p['market']}\nЦена выхода: {current_price}")
+                        continue
+                    if change <= -0.10:
+                        print(f"🛑 Stop Loss -10%: закрываем {p['market']}")
+                        close_position(token_id, p["tokens"], current_price)
+                        to_delete.append(token_id)
+                        send_telegram(f"🛑 <b>STOP LOSS -10%:</b> {p['market']}\nЦена выхода: {current_price}")
+                        continue
+
             if now > close_at:
-                current_price = get_current_price(token_id)
                 if current_price is None:
                     current_price = p["entry_price"]
                     print(f"  ⚠️ Не удалось получить цену для {token_id}, используем entry_price")
@@ -397,13 +414,15 @@ def run():
                 
                 wallet = (t.get("proxyWallet") or "").lower()
                 price = float(t.get("price", 0))
-                size_usdc = float(t.get("size", 0)) * price
+                size_usdc = float(t.get("size", 0))
                 
                 is_known_whale = wallet in top_wallets and size_usdc >= MIN_SIZE_USDC
                 is_big_trade = size_usdc >= WHALE_MIN_SIZE
                 
                 if is_known_whale or is_big_trade:
                     ts_raw = int(t.get("timestamp", 0))
+                    if ts_raw == 0:
+                        continue
                     ts_sec = ts_raw / 1000 if ts_raw > 1e11 else ts_raw
                     
                     rolling_buffer.append({

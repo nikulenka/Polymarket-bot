@@ -1,5 +1,5 @@
 import httpx, pandas as pd
-proxies = set(pd.read_csv('data/top_proxies.csv')['proxy'].str.lower())
+proxies = set(pd.read_csv('data/top_wallets.csv')['wallet'].str.lower())
 try:
     trades = httpx.get('https://data-api.polymarket.com/trades', params={'limit': 10000}).json()
     found_whales = 0

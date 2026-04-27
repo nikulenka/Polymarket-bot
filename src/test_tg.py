@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 import httpx
 
 load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOCKEN") or os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:

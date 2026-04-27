@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_TOCKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 if not TOKEN:
     print("❌ Токен не найден в .env")
