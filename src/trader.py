@@ -26,7 +26,7 @@ def get_client():
         chain_id=POLYGON,
         key=key,
         creds=creds,
-        signature_type=1 if proxy_address else None,
+        signature_type=2 if proxy_address else None,
         funder=proxy_address if proxy_address else None
     )
 
