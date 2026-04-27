@@ -48,9 +48,15 @@ logging.basicConfig(
 
 from dotenv import load_dotenv
 load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOCKEN") or os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+SENT_SIGNALS_CACHE = None
+
+def init_sent_cache():
+    global SENT_SIGNALS_CACHE
+    SENT_SIGNALS_CACHE = load_sent()
 
 
 # ============================================================
@@ -84,7 +90,10 @@ def save_sent(sent):
         json.dump(sent, f)
 
 def is_duplicate(sig_key_str, cooldown_hours=12):
-    sent = load_sent()
+    global SENT_SIGNALS_CACHE
+    if SENT_SIGNALS_CACHE is None:
+        init_sent_cache()
+    sent = SENT_SIGNALS_CACHE
     if sig_key_str in sent:
         try:
             last = datetime.fromisoformat(sent[sig_key_str])
@@ -98,7 +107,10 @@ def is_duplicate(sig_key_str, cooldown_hours=12):
 
 def mark_sent(sig_key_str):
     """Записывает сигнал и чистит записи старше SIGNALS_TTL_H (NEW-6)."""
-    sent = load_sent()
+    global SENT_SIGNALS_CACHE
+    if SENT_SIGNALS_CACHE is None:
+        init_sent_cache()
+    sent = SENT_SIGNALS_CACHE
     sent[sig_key_str] = datetime.now(timezone.utc).isoformat()
     # NEW-6: удаляем протухшие записи
     now = datetime.now(timezone.utc)
@@ -113,6 +125,7 @@ def mark_sent(sig_key_str):
         except Exception:
             pass  # битая запись — выбрасываем
     save_sent(cleaned)
+    SENT_SIGNALS_CACHE = cleaned
 
 
 # ============================================================
@@ -125,13 +138,13 @@ def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         httpx.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=5)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [!] Ошибка отправки в Telegram: {e}")
 
 def validate_signal_with_claude(sig, market_name):
     """Валидация сигнала через LLM."""
     if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "твой_ключ_сюда":
-        return {"decision": "TRADE", "confidence": 100, "reason": "No API key — auto-approve"}
+        return {"decision": "SKIP", "confidence": 0, "reason": "No LLM API key — safe mode enforced"}
     
     prompt = (
         f"Проанализируй сигнал Polymarket: {market_name}. "
@@ -274,8 +287,15 @@ def resolve_token_id(tokens_map, target_outcome, signal_side):
         # Если киты продают "Yes", мы покупаем "No"
         opposite_tokens = {k: v for k, v in tokens_map.items() if k != target_lower}
         if opposite_tokens:
-            opp_outcome = next(iter(opposite_tokens))
-            return opposite_tokens[opp_outcome], "BUY"
+            if "no" in opposite_tokens and target_lower == "yes":
+                return opposite_tokens["no"], "BUY"
+            elif "yes" in opposite_tokens and target_lower == "no":
+                return opposite_tokens["yes"], "BUY"
+            
+            if len(opposite_tokens) == 1:
+                opp_outcome = next(iter(opposite_tokens))
+                return opposite_tokens[opp_outcome], "BUY"
+            return None, "BUY"
         # fallback: покупаем "no"
         token_id = tokens_map.get("no")
         return token_id, "BUY"
@@ -308,12 +328,15 @@ def manage_positions():
                     print(f"  ⚠️ Не удалось получить цену для {token_id}, используем entry_price")
                 
                 print(f"⏰ Время вышло: закрываем {p['market']} (цена: {current_price})")
-                close_position(token_id, p["tokens"], current_price)
-                to_delete.append(token_id)
-                send_telegram(
-                    f"⏰ <b>ВРЕМЯ ВЫШЛО:</b> Позиция закрыта\n"
-                    f"{p['market']}\nЦена выхода: {current_price}"
-                )
+                res = close_position(token_id, p["tokens"], current_price)
+                if res:
+                    to_delete.append(token_id)
+                    send_telegram(
+                        f"⏰ <b>ВРЕМЯ ВЫШЛО:</b> Позиция закрыта\n"
+                        f"{p['market']}\nЦена выхода: {current_price}"
+                    )
+                else:
+                    print(f"  ❌ Ошибка закрытия: {token_id} оставлен в позициях")
         except Exception as e:
             print(f"Error managing pos {token_id}: {e}")
             
@@ -332,7 +355,12 @@ def run():
     print("  Polymarket Bot v3 — Whale Trader запущен")
     print("=" * 60)
 
-    top_wallets = set(pd.read_csv(TOP_WALLETS)["wallet"].str.lower())
+    try:
+        top_wallets = set(pd.read_csv(TOP_WALLETS)["wallet"].str.lower())
+    except Exception as e:
+        print(f"⚠️ Ошибка загрузки китов ({TOP_WALLETS}): {e}. Ждем появления файла...")
+        top_wallets = set()
+
     seen_hashes = OrderedDict()
     rolling_buffer = []  
     total_signals = 0
@@ -357,10 +385,15 @@ def run():
             new_count = 0
             for t in trades:
                 tx = t.get("transactionHash", "")
-                if not tx or tx in seen_hashes:
+                outcome = t.get("outcome", "")
+                if not tx:
                     continue
                 
-                seen_hashes[tx] = True
+                tx_key = f"{tx}_{outcome}"
+                if tx_key in seen_hashes:
+                    continue
+                
+                seen_hashes[tx_key] = True
                 
                 wallet = (t.get("proxyWallet") or "").lower()
                 price = float(t.get("price", 0))
@@ -395,8 +428,12 @@ def run():
                 market_buckets[b["cond_id"]].append(b)
 
             for cond_id, entries in market_buckets.items():
+                if not cond_id:
+                    continue
+                
                 market_name = entries[0]["market"]
-                if any(p in market_name for p in SKIP_PATTERNS):
+                market_lower = market_name.lower()
+                if any(p.lower() in market_lower for p in SKIP_PATTERNS):
                     continue
                 
                 buy_w = {e["wallet"] for e in entries if e["side"] == "BUY"}
@@ -438,7 +475,9 @@ def run():
                     
                     trade_status = "⏭ Пропущен (нет TokenID)"
                     
-                    if token_id and 0 < trade_price < 1:
+                    if trade_price > 0.98:
+                        trade_status = f"⏭ Пропущен (цена {trade_price:.4f} слишком высока)"
+                    elif token_id and 0 < trade_price < 1:
                         action_desc = f"{order_side} (сигнал: {side})"
                         print(f"💰 Открываем сделку {action_desc} на $2: {market_name}")
                         res = place_bet(token_id, order_side, 2.0, trade_price)

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Переходим в директорию бота
-cd "/Users/vitalyn/00 Antigravity/Polymarket-bot" || exit
+cd "$(dirname "$0")" || exit
 
 echo "[$(date)] Начинаем ежедневное обновление базы Polymarket-bot..."
 

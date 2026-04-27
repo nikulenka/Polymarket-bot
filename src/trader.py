@@ -14,12 +14,17 @@ def get_client():
         api_secret=os.getenv("POLY_API_SECRET"),
         api_passphrase=os.getenv("POLY_API_PASSPHRASE"),
     )
+    
+    key = os.getenv("POLY_PRIVATE_KEY")
+    if key and not key.startswith("0x"):
+        key = "0x" + key
+        
     return ClobClient(
         host="https://clob.polymarket.com",
         chain_id=POLYGON,
-        key=os.getenv("POLY_PRIVATE_KEY"),
-        creds=creds,
-        signature_type=1  # EOA (Standard Wallet)
+        key=key,
+        creds=creds
+        # signature_type удален, чтобы библиотека использовала EOA по умолчанию
     )
 
 def place_bet(token_id: str, side: str, size_usd: float, price: float):
@@ -28,18 +33,22 @@ def place_bet(token_id: str, side: str, size_usd: float, price: float):
         print(f"  [!] Некорректная цена: {price} (должна быть 0 < price < 1)")
         return None
     
-    token_size = round(size_usd / price, 1)
+    token_size = round(size_usd / price, 4)
     if token_size < MIN_ORDER_SIZE:
         print(f"  [!] Размер ордера слишком мал: {token_size} токенов")
         return None
     
-    print(f"  📋 Ордер: {side} {token_size} токенов @ {price:.4f} (${size_usd:.2f})")
+    # Ограничиваем цену максимумом 0.99 и округляем до 4 знаков
+    # Polymarket CLOB не принимает ордера по 1.0 или выше 0.99 на некоторых рынках
+    safe_price = min(0.99, round(price, 4))
+    
+    print(f"  📋 Ордер: {side} {token_size} токенов @ {safe_price:.4f} (${size_usd:.2f})")
     
     try:
         client = get_client()
         order_args = OrderArgs(
             token_id=token_id,
-            price=round(price, 2),
+            price=safe_price,
             size=token_size,
             side=side,
         )
@@ -57,18 +66,21 @@ def close_position(token_id: str, size: float, current_price: float):
         print(f"  [!] Некорректная цена закрытия: {current_price}")
         return None
     
-    token_size = round(size, 1)
+    token_size = round(size, 4)
     if token_size < MIN_ORDER_SIZE:
         print(f"  [!] Размер на закрытие слишком мал: {token_size}")
         return None
     
-    print(f"  📋 Закрытие: SELL {token_size} токенов @ {current_price:.4f}")
+    # При закрытии (продаже) тоже ограничиваем цену
+    safe_price = min(0.99, round(current_price, 4))
+    
+    print(f"  📋 Закрытие: SELL {token_size} токенов @ {safe_price:.4f}")
     
     try:
         client = get_client()
         order_args = OrderArgs(
             token_id=token_id,
-            price=round(current_price, 2),
+            price=safe_price,
             size=token_size,
             side="SELL",
         )

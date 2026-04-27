@@ -2,3 +2,4 @@ httpx
 pandas
 python-dotenv
 anthropic
+py-clob-client
