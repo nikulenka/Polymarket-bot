@@ -1,0 +1,1 @@
+./run.sh: line 4: 72374 Terminated: 15          ./venv/bin/python3 -u src/monitor.py >> logs/monitor.log 2>&1
