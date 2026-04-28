@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, OrderedDict
 from statistics import median
-from src.trader import place_bet, close_position
+from src.trader import place_bet, close_position, get_usdc_balance
 
 # --- Конфиг ---
 DATA_API       = "https://data-api.polymarket.com"
@@ -20,6 +20,8 @@ POSITIONS_FILE = "data/open_positions.json"
 LOG_DIR        = "logs"
 LOG_FILE       = "logs/signals.log"
 POLL_INTERVAL  = 30    
+TIMEOUT        = 15      # Таймаут для всех запросов
+HEARTBEAT_INT  = 600     # Пульс в лог раз в 10 минут
 SIGNAL_WINDOW  = 43200  # 12 часов
 MIN_WALLETS    = 2     
 MIN_SIZE_USDC  = 50.0    # Порог для известных китов
@@ -513,31 +515,38 @@ def run():
                         trade_status = f"⏭ Пропущен (цена {trade_price:.4f} слишком высока)"
                     elif token_id and 0.01 <= trade_price < 1:
                         action_desc = f"{order_side} (сигнал: {side})"
-                        print(f"💰 Открываем сделку {action_desc} на $2: {market_name}")
-                        res = place_bet(token_id, order_side, 2.0, trade_price)
-                        if res:
-                            trade_status = f"✅ СДЕЛКА: {action_desc}"
-                            # Динамический расчет как в trader.py
-                            MIN_TOKENS = 5.0
-                            entry_usd = 2.0
-                            entry_tokens = entry_usd / trade_price if trade_price > 0 else 0
-                            if entry_tokens < MIN_TOKENS:
-                                entry_tokens = MIN_TOKENS
-                                entry_usd = entry_tokens * trade_price
-                            
-                            cached_positions[token_id] = {
-                                "market": market_name,
-                                "side": order_side,
-                                "signal_side": side,
-                                "entry_price": trade_price,
-                                "size_usd": entry_usd,
-                                "tokens": entry_tokens,
-                                "opened_at": datetime.now(timezone.utc).isoformat(),
-                                "close_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
-                            }
-                            save_positions(cached_positions)
+                        
+                        # ПРОВЕРКА БАЛАНСА ПЕРЕД ПОКУПКОЙ
+                        balance = get_usdc_balance()
+                        if balance < 1.0:
+                            trade_status = f"⏭ Пропущен (баланс ${balance:.2f} < $1.00)"
+                            print(f"  ⚠️ Недостаточно средств для торговли (баланс: ${balance:.2f}). Жду пополнения.")
                         else:
-                            trade_status = "❌ Ошибка ордера"
+                            print(f"💰 Открываем сделку {action_desc} на $2: {market_name} (баланс: ${balance:.2f})")
+                            res = place_bet(token_id, order_side, 2.0, trade_price)
+                            if res:
+                                trade_status = f"✅ СДЕЛКА: {action_desc}"
+                                # Динамический расчет как в trader.py
+                                MIN_TOKENS = 5.0
+                                entry_usd = 2.0
+                                entry_tokens = entry_usd / trade_price if trade_price > 0 else 0
+                                if entry_tokens < MIN_TOKENS:
+                                    entry_tokens = MIN_TOKENS
+                                    entry_usd = entry_tokens * trade_price
+                                
+                                cached_positions[token_id] = {
+                                    "market": market_name,
+                                    "side": order_side,
+                                    "signal_side": side,
+                                    "entry_price": trade_price,
+                                    "size_usd": entry_usd,
+                                    "tokens": entry_tokens,
+                                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                                    "close_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
+                                }
+                                save_positions(cached_positions)
+                            else:
+                                trade_status = "❌ Ошибка ордера"
                     
                     total_signals += 1
                     msg = (

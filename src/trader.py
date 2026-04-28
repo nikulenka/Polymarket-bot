@@ -22,7 +22,7 @@ def get_client():
     proxy_address = os.getenv("POLY_PROXY_ADDRESS")
     
     return ClobClient(
-        host="https://clob.polymarket.com",
+        host="https://clob-v2.polymarket.com",
         chain_id=POLYGON,
         key=key,
         creds=creds,
@@ -74,23 +74,36 @@ def place_bet(token_id: str, side: str, size_usd: float, price: float):
         return None
 
 def close_position(token_id: str, size: float, current_price: float):
-    """Закрывает позицию (продаёт токены)."""
+    """Закрывает позицию (продаёт токены) с проверкой баланса."""
     if current_price <= 0:
         print(f"  [!] Некорректная цена закрытия: {current_price}")
         return None
     
-    token_size = round(size, 4)
-    if token_size < MIN_ORDER_SIZE:
-        print(f"  [!] Размер на закрытие слишком мал: {token_size}")
-        return None
-    
-    # При закрытии (продаже) тоже ограничиваем цену
-    safe_price = min(0.99, round(current_price, 4))
-    
-    print(f"  📋 Закрытие: SELL {token_size} токенов @ {safe_price:.4f}")
-    
     try:
         client = get_client()
+        
+        # Проверка реального баланса перед продажей
+        balance_info = client.get_balance(token_id)
+        # balance_info обычно имеет вид {'balance': '5000000', ...}
+        raw_balance = int(balance_info.get("balance", 0))
+        real_balance = raw_balance / 10**6 # Polymarket использует 6 знаков
+        
+        print(f"  [i] Проверка баланса: у нас {real_balance} токенов, хотим продать {size}")
+        
+        if real_balance < 0.1: # Если меньше 0.1 токена, считаем что позиции нет
+            print(f"  [!] Ошибка: на балансе нет токенов {token_id}. Пропускаем закрытие.")
+            return True # Возвращаем True, чтобы бот удалил эту "фантомную" позицию из памяти
+            
+        token_size = min(real_balance, round(size, 4))
+        if token_size < 5.0: # Минимальный размер ордера на продажу тоже 5 токенов
+            print(f"  [!] Баланс {token_size} меньше минимального ордера (5). Ждем или увеличиваем.")
+            # Если у нас меньше 5 токенов, мы не сможем их продать через CLOB.
+            # В этом случае либо ждать закрытия рынка, либо оставить как есть.
+            return False
+
+        safe_price = min(0.99, round(current_price, 4))
+        print(f"  📋 Закрытие: SELL {token_size} токенов @ {safe_price:.4f}")
+        
         order_args = OrderArgs(
             token_id=token_id,
             price=safe_price,
@@ -104,3 +117,26 @@ def close_position(token_id: str, size: float, current_price: float):
     except Exception as e:
         print(f"  [!] Ошибка закрытия позиции: {e}")
         return None
+
+def get_usdc_balance():
+    """Получает баланс pUSD (новый Cash) на прокси-кошельке."""
+    # Адрес pUSD на Polygon
+    PUSD = "0x23a1aB2F10B247a3e35A22e036e52E3E852D4203"
+    try:
+        client = get_client()
+        # В этой версии SDK используем get_balance_allowance
+        resp = client.get_balance_allowance(asset_type="collateral", token_id=PUSD)
+        # Ответ: {"balance": "1500000", "allowance": "..."}
+        raw_balance = int(resp.get("balance", 0))
+        return raw_balance / 10**6
+    except Exception as e:
+        print(f"  [!] Ошибка получения баланса pUSD: {e}")
+        # Попробуем старый USDC.e если pUSD не сработал
+        try:
+            USDCE = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+            client = get_client()
+            resp = client.get_balance_allowance(asset_type="collateral", token_id=USDCE)
+            raw_balance = int(resp.get("balance", 0))
+            return raw_balance / 10**6
+        except:
+            return 0.0
