@@ -1,6 +1,6 @@
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
-from py_clob_client.clob_types import OrderArgs, OrderType, ApiCreds
+from py_clob_client.clob_types import OrderArgs, OrderType, ApiCreds, BalanceAllowanceParams, AssetType
 import os
 from dotenv import load_dotenv
 
@@ -22,7 +22,7 @@ def get_client():
     proxy_address = os.getenv("POLY_PROXY_ADDRESS")
     
     return ClobClient(
-        host="https://clob-v2.polymarket.com",
+        host="https://clob.polymarket.com",
         chain_id=POLYGON,
         key=key,
         creds=creds,
@@ -120,23 +120,14 @@ def close_position(token_id: str, size: float, current_price: float):
 
 def get_usdc_balance():
     """Получает баланс pUSD (новый Cash) на прокси-кошельке."""
-    # Адрес pUSD на Polygon
-    PUSD = "0x23a1aB2F10B247a3e35A22e036e52E3E852D4203"
     try:
         client = get_client()
-        # В этой версии SDK используем get_balance_allowance
-        resp = client.get_balance_allowance(asset_type="collateral", token_id=PUSD)
-        # Ответ: {"balance": "1500000", "allowance": "..."}
+        # В CLOB V2 для collateral asset_id должен быть пустым
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        resp = client.get_balance_allowance(params=params)
+        # Ответ: {"balance": "14404590", "allowances": {...}}
         raw_balance = int(resp.get("balance", 0))
         return raw_balance / 10**6
     except Exception as e:
-        print(f"  [!] Ошибка получения баланса pUSD: {e}")
-        # Попробуем старый USDC.e если pUSD не сработал
-        try:
-            USDCE = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-            client = get_client()
-            resp = client.get_balance_allowance(asset_type="collateral", token_id=USDCE)
-            raw_balance = int(resp.get("balance", 0))
-            return raw_balance / 10**6
-        except:
-            return 0.0
+        print(f"  [!] Ошибка получения баланса collateral: {e}")
+        return 0.0
