@@ -1,122 +1,121 @@
-from py_clob_client.client import ClobClient
-from py_clob_client.constants import POLYGON
-from py_clob_client.clob_types import OrderArgs, OrderType, ApiCreds, BalanceAllowanceParams, AssetType
 import os
 from dotenv import load_dotenv
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.constants import POLYGON
+from py_clob_client_v2.clob_types import OrderArgs, OrderType, ApiCreds, BalanceAllowanceParams, AssetType
 
 load_dotenv()
 
-MIN_ORDER_SIZE = 0.1  # Минимальный размер ордера в токенах
+CLOB_API = "https://clob.polymarket.com"
 
 def get_client():
+    """Инициализирует клиент для CLOB V2 API."""
     creds = ApiCreds(
         api_key=os.getenv("POLY_API_KEY"),
         api_secret=os.getenv("POLY_API_SECRET"),
         api_passphrase=os.getenv("POLY_API_PASSPHRASE"),
     )
-    
-    key = os.getenv("POLY_PRIVATE_KEY")
-    if key and not key.startswith("0x"):
-        key = "0x" + key
+    private_key = os.getenv("POLY_PRIVATE_KEY")
+    if private_key and not private_key.startswith("0x"):
+        private_key = "0x" + private_key
         
     proxy_address = os.getenv("POLY_PROXY_ADDRESS")
     
-    return ClobClient(
-        host="https://clob.polymarket.com",
-        chain_id=POLYGON,
-        key=key,
-        creds=creds,
-        signature_type=2 if proxy_address else None,
-        funder=proxy_address if proxy_address else None
+    # В V2 SDK используется SignatureTypeV2. POLY_GNOSIS_SAFE = 2
+    client = ClobClient(
+        CLOB_API, 
+        POLYGON, 
+        private_key, 
+        creds, 
+        signature_type=2 if proxy_address else None, 
+        funder=proxy_address
     )
+    return client
 
-def place_bet(token_id: str, side: str, size_usd: float, price: float):
-    """Выставляет ордер на покупку/продажу токена."""
-    if price <= 0 or price >= 1:
-        print(f"  [!] Некорректная цена: {price} (должна быть 0 < price < 1)")
-        return None
-    
-    # Динамический расчет размера ордера
-    # Polymarket CLOB требует минимум 5 токенов для любого ордера
-    MIN_TOKENS = 5.0
-    token_size = size_usd / price
-    
-    if token_size < MIN_TOKENS:
-        # Увеличиваем сумму до минимально необходимых 5 токенов
-        token_size = MIN_TOKENS
-        new_size_usd = token_size * price
-        print(f"  [i] Сумма увеличена с ${size_usd:.2f} до ${new_size_usd:.2f} (минимум {MIN_TOKENS} токенов)")
-        size_usd = new_size_usd
-    
-    token_size = round(token_size, 4)
-    safe_price = max(0.01, min(0.99, round(price, 4)))
-    
-    if price < 0.01:
-        print(f"  [!] Цена {price} ниже минимально допустимой (0.01)")
-        return None
-    
-    print(f"  📋 Ордер: {side} {token_size} токенов @ {safe_price:.4f} (${size_usd:.2f})")
-    
+def place_bet(token_id, side, amount_usd, price):
+    """
+    Выставляет GTC ордер на Polymarket CLOB V2.
+    """
     try:
+        # Округляем цену до 4 знаков (стандарт CLOB)
+        safe_price = round(float(price), 4)
+        if safe_price < 0.01: safe_price = 0.01
+        if safe_price > 0.99: safe_price = 0.99
+        
+        # Рассчитываем размер позиции (количество токенов)
+        # Polymarket требует минимум 5 токенов для сделки
+        MIN_TOKENS = 5.0
+        token_size = float(amount_usd) / safe_price
+        if token_size < MIN_TOKENS:
+            token_size = MIN_TOKENS
+            print(f"  [i] Размер увеличен до минимума: {token_size:.4f} токенов")
+        
+        token_size = round(token_size, 4)
+        
         client = get_client()
+        
+        # Подготовка аргументов для V2 ордера
         order_args = OrderArgs(
             token_id=token_id,
             price=safe_price,
             size=token_size,
             side=side,
         )
+        
+        print(f"  📋 Ордер: {side} {token_size} токенов @ {safe_price} (${amount_usd:.2f})")
+        
+        # Создаем и подписываем ордер. V2 SDK автоматически выбирает версию контракта.
         signed_order = client.create_order(order_args)
-        resp = client.post_order(signed_order, OrderType.GTC)
-        print(f"  ✅ Ордер отправлен: {resp}")
-        return resp
-    except Exception as e:
-        print(f"  [!] Ошибка выставления ордера: {e}")
-        return None
-
-def close_position(token_id: str, size: float, current_price: float):
-    """Закрывает позицию (продаёт токены) с проверкой баланса."""
-    if current_price <= 0:
-        print(f"  [!] Некорректная цена закрытия: {current_price}")
-        return None
-    
-    try:
-        client = get_client()
         
-        # Проверка реального баланса перед продажей
-        balance_info = client.get_balance(token_id)
-        # balance_info обычно имеет вид {'balance': '5000000', ...}
-        raw_balance = int(balance_info.get("balance", 0))
-        real_balance = raw_balance / 10**6 # Polymarket использует 6 знаков
+        # Отправляем ордер. 
+        # V2 SDK автоматически обрабатывает order_version_mismatch и обновляет версию.
+        resp = client.post_order(signed_order)
         
-        print(f"  [i] Проверка баланса: у нас {real_balance} токенов, хотим продать {size}")
-        
-        if real_balance < 0.1: # Если меньше 0.1 токена, считаем что позиции нет
-            print(f"  [!] Ошибка: на балансе нет токенов {token_id}. Пропускаем закрытие.")
-            return True # Возвращаем True, чтобы бот удалил эту "фантомную" позицию из памяти
-            
-        token_size = min(real_balance, round(size, 4))
-        if token_size < 5.0: # Минимальный размер ордера на продажу тоже 5 токенов
-            print(f"  [!] Баланс {token_size} меньше минимального ордера (5). Ждем или увеличиваем.")
-            # Если у нас меньше 5 токенов, мы не сможем их продать через CLOB.
-            # В этом случае либо ждать закрытия рынка, либо оставить как есть.
+        if resp and resp.get("success"):
+            print(f"  ✅ Ордер успешно выставлен! ID: {resp.get('orderID')}")
+            return True
+        else:
+            print(f"  [!] Ошибка выставления ордера: {resp}")
             return False
+            
+    except Exception as e:
+        print(f"  [!] Exception в place_bet: {e}")
+        return False
 
-        safe_price = min(0.99, round(current_price, 4))
-        print(f"  📋 Закрытие: SELL {token_size} токенов @ {safe_price:.4f}")
+def close_position(token_id, size, price):
+    """
+    Закрывает позицию (продает токены).
+    """
+    try:
+        # Для закрытия позиции (продажи) выставляем SELL ордер
+        safe_price = round(float(price), 4)
+        if safe_price < 0.005: safe_price = 0.005
         
+        token_size = round(float(size), 4)
+        
+        client = get_client()
         order_args = OrderArgs(
             token_id=token_id,
             price=safe_price,
             size=token_size,
             side="SELL",
         )
+        
+        print(f"  🔻 Закрываем позицию: SELL {token_size} токенов @ {safe_price}")
+        
         signed_order = client.create_order(order_args)
-        resp = client.post_order(signed_order, OrderType.GTC)
-        print(f"  ✅ Позиция закрыта: {resp}")
-        return resp
+        resp = client.post_order(signed_order)
+        
+        if resp and resp.get("success"):
+            print(f"  ✅ Позиция закрыта! ID: {resp.get('orderID')}")
+            return True
+        else:
+            print(f"  [!] Ошибка закрытия позиции: {resp}")
+            return False
+            
     except Exception as e:
-        print(f"  [!] Ошибка закрытия позиции: {e}")
-        return None
+        print(f"  [!] Exception в close_position: {e}")
+        return False
 
 def get_usdc_balance():
     """Получает баланс pUSD (новый Cash) на прокси-кошельке."""
@@ -124,10 +123,11 @@ def get_usdc_balance():
         client = get_client()
         # В CLOB V2 для collateral asset_id должен быть пустым
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        resp = client.get_balance_allowance(params=params)
-        # Ответ: {"balance": "14404590", "allowances": {...}}
-        raw_balance = int(resp.get("balance", 0))
-        return raw_balance / 10**6
+        resp = client.get_balance_allowance(params)
+        
+        if resp:
+            raw_balance = float(resp.get("balance", 0))
+            return raw_balance / 10**6 # pUSD uses 6 decimals
     except Exception as e:
-        print(f"  [!] Ошибка получения баланса collateral: {e}")
-        return 0.0
+        print(f"  [!] Ошибка получения баланса: {e}")
+    return 0.0

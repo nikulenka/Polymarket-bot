@@ -14,6 +14,7 @@ from src.trader import place_bet, close_position, get_usdc_balance
 # --- Конфиг ---
 DATA_API       = "https://data-api.polymarket.com"
 GAMMA_API      = "https://gamma-api.polymarket.com"
+CLOB_API       = "https://clob.polymarket.com"
 TOP_WALLETS    = "data/top_wallets.csv"
 SIGNALS_FILE   = "data/sent_signals.json"
 POSITIONS_FILE = "data/open_positions.json"
@@ -211,32 +212,32 @@ def fetch_trades(limit, timeout=15):
 # ============================================================
 
 def get_market_tokens(condition_id):
-    """Получает tokenIds для исходов. Возвращает dict {outcome_lower: token_id}."""
+    """Получает tokenIds для исходов через CLOB API. Возвращает dict или 'CLOSED'."""
     try:
-        # ВАЖНО: Правильный параметр condition_ids (множественное число)
+        resp = httpx.get(f"{CLOB_API}/markets/{condition_id}", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("closed"):
+                return "CLOSED"
+            
+            tokens = data.get("tokens", [])
+            if tokens:
+                return {t.get("outcome", "").lower(): t.get("token_id") for t in tokens}
+            
+            # Fallback на Gamma API если в CLOB нет токенов (редко)
+            print(f"  ⚠️ В CLOB API нет токенов для {condition_id}, пробуем Gamma...")
+        
+        # Резервный вариант через Gamma API
         resp = httpx.get(f"{GAMMA_API}/markets", params={"condition_ids": condition_id}, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             if data:
-                # Дополнительная проверка, что мы получили именно тот рынок
-                target_market = None
-                for m in data:
-                    if m.get("conditionId") == condition_id:
-                        target_market = m
-                        break
-                
-                if not target_market:
-                    print(f"  ⚠️ В ответе API не найден рынок с ID {condition_id}")
-                    return None
-                
-                m = target_market
+                m = data[0]
                 tokens_raw = m.get("clobTokenIds")
                 if tokens_raw:
                     tokens = json.loads(tokens_raw)
                     outcomes = json.loads(m.get("outcomes", '["Yes", "No"]'))
                     return {outcomes[i].lower(): tokens[i] for i in range(len(tokens))}
-            else:
-                print(f"  ⚠️ Gamma API вернул пустой список для condition_id={condition_id}")
     except Exception as e:
         print(f"  [!] Ошибка получения токенов для {condition_id}: {e}")
     return None
@@ -503,13 +504,18 @@ def run():
                     tokens_map = get_market_tokens(cond_id)
                     target_outcome = get_consensus_outcome(entries, side)
                     
-                    # NEW-1: resolve_token_id учитывает SELL → покупка NO
-                    token_id, order_side = resolve_token_id(tokens_map, target_outcome, side)
+                    trade_status = "⏭ Пропущен (нет TokenID)"
+                    token_id = None
+                    order_side = "BUY"
+                    
+                    if tokens_map == "CLOSED":
+                        trade_status = "⏭ Пропущен (Рынок закрыт)"
+                    elif tokens_map:
+                        # NEW-1: resolve_token_id учитывает SELL → покупка NO
+                        token_id, order_side = resolve_token_id(tokens_map, target_outcome, side)
                     
                     # NEW-2: медианная цена из нужной стороны
                     trade_price = get_median_price(entries, side)
-                    
-                    trade_status = "⏭ Пропущен (нет TokenID)"
                     
                     if trade_price > 0.98:
                         trade_status = f"⏭ Пропущен (цена {trade_price:.4f} слишком высока)"
