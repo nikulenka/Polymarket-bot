@@ -9,56 +9,39 @@ import json
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, OrderedDict
 from statistics import median
+from functools import lru_cache
+
 from src.trader import place_bet, close_position, get_usdc_balance
+from src.config import CONFIG, load_config
+from src.cache import TelegramBatcher, PriceCacheManager, send_telegram_batched
+from src.logger import setup_logging
 
-# --- Конфиг ---
-DATA_API       = "https://data-api.polymarket.com"
-GAMMA_API      = "https://gamma-api.polymarket.com"
-CLOB_API       = "https://clob.polymarket.com"
-TOP_WALLETS    = "data/top_wallets.csv"
-SIGNALS_FILE   = "data/sent_signals.json"
-POSITIONS_FILE = "data/open_positions.json"
-LOG_DIR        = "logs"
-LOG_FILE       = "logs/signals.log"
-POLL_INTERVAL  = 30    
-TIMEOUT        = 15      # Таймаут для всех запросов
-HEARTBEAT_INT  = 600     # Пульс в лог раз в 10 минут
-SIGNAL_WINDOW  = 43200  # 12 часов
-MIN_WALLETS    = 2     
-MIN_SIZE_USDC  = 50.0    # Порог для известных китов
-WHALE_MIN_SIZE = 1000.0  # Любая сделка от $1000 = динамический кит
-MAX_SEEN       = 30_000  # Лимит хэшей в памяти
-MAX_BUFFER     = 50_000  # Лимит записей в rolling_buffer
-SIGNALS_TTL_H  = 48      # Время жизни записей в sent_signals.json
+# === QUICK WIN OPTIMIZATION: Используем централизованную конфигурацию ===
+CONFIG = load_config()
 
-SKIP_PATTERNS = [
-    "NBA", "NFL", "NHL", "MLB", "soccer", "win the", 
-    "beat the", "Series", "Finals", "Championship",
-    "Buccaneers", "Lakers", "Spurs", "Hawks", "Knicks",
-    "Celtics", "Warriors", "Nuggets", "Playoffs",
-    "AM-", "PM-", "AM ET", "PM ET", ":00AM", ":00PM", "Up or Down -",
-    " vs ", " vs. ", " FC ", " United ", " Real ", " City ", " Atletico ",
-    "Madrid Open", "Tennis", "ATP", "WTA", "Winner", "Map 1", "Map 2",
-    "Counter-Strike", "CS2", "Dota", "Esports", "UFC", "MMA", "Boxing",
-    "Total Sets", "O/U 2.5", "O/U 3.5", "O/U 4.5", "Total Goals",
-    "Premier League", "Champions League", "La Liga", "Bundesliga"
-]
-
-os.makedirs(LOG_DIR, exist_ok=True)
+# Создаем структуру папок
+os.makedirs(CONFIG.files.log_dir, exist_ok=True)
 os.makedirs("data", exist_ok=True)
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+# Инициализируем логирование (JSON формат)
+logger = setup_logging(
+    log_file=CONFIG.files.signals_file.replace(".json", ".log"),
+    json_format=False  # Текстовый для удобства в консоли, JSON в файл будет добавлен позже
 )
 
-from dotenv import load_dotenv
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# === QUICK WIN #4: Инициализируем Telegram Batcher вместо send_telegram() ===
+telegram_batcher = None
+if CONFIG.telegram.enabled and CONFIG.telegram.token and CONFIG.telegram.chat_id:
+    telegram_batcher = TelegramBatcher(
+        token=CONFIG.telegram.token,
+        chat_id=CONFIG.telegram.chat_id,
+        batch_interval_sec=CONFIG.telegram.batch_interval_sec,
+        max_batch_size=CONFIG.telegram.max_batch_size,
+        timeout=CONFIG.timeout.telegram_timeout
+    )
+
+# === QUICK WIN #3: Инициализируем Price Cache Manager ===
+price_cache = PriceCacheManager(ttl_seconds=CONFIG.cache.price_cache_ttl_sec)
 
 SENT_SIGNALS_CACHE = None
 
@@ -72,29 +55,29 @@ def init_sent_cache():
 # ============================================================
 
 def load_positions():
-    if os.path.exists(POSITIONS_FILE):
+    if os.path.exists(CONFIG.files.positions_file):
         try:
-            with open(POSITIONS_FILE) as f:
+            with open(CONFIG.files.positions_file) as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
 def save_positions(pos):
-    with open(POSITIONS_FILE, "w") as f:
+    with open(CONFIG.files.positions_file, "w") as f:
         json.dump(pos, f, indent=2)
 
 def load_sent():
-    if os.path.exists(SIGNALS_FILE):
+    if os.path.exists(CONFIG.files.signals_file):
         try:
-            with open(SIGNALS_FILE) as f:
+            with open(CONFIG.files.signals_file) as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
 def save_sent(sent):
-    with open(SIGNALS_FILE, "w") as f:
+    with open(CONFIG.files.signals_file, "w") as f:
         json.dump(sent, f)
 
 def is_duplicate(sig_key_str, cooldown_hours=12):
@@ -114,13 +97,13 @@ def is_duplicate(sig_key_str, cooldown_hours=12):
     return False
 
 def mark_sent(sig_key_str):
-    """Записывает сигнал и чистит записи старше SIGNALS_TTL_H (NEW-6)."""
+    """Записывает сигнал и чистит записи старше SIGNALS_TTL_H."""
     global SENT_SIGNALS_CACHE
     if SENT_SIGNALS_CACHE is None:
         init_sent_cache()
     sent = SENT_SIGNALS_CACHE
     sent[sig_key_str] = datetime.now(timezone.utc).isoformat()
-    # NEW-6: удаляем протухшие записи
+    # Удаляем протухшие записи
     now = datetime.now(timezone.utc)
     cleaned = {}
     for k, v in sent.items():
@@ -128,7 +111,7 @@ def mark_sent(sig_key_str):
             ts = datetime.fromisoformat(v)
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            if now - ts < timedelta(hours=SIGNALS_TTL_H):
+            if now - ts < timedelta(hours=CONFIG.files.signals_ttl_hours):
                 cleaned[k] = v
         except Exception:
             pass  # битая запись — выбрасываем
@@ -141,18 +124,21 @@ def mark_sent(sig_key_str):
 # ============================================================
 
 def send_telegram(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        httpx.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=5)
-    except Exception as e:
-        print(f"  [!] Ошибка отправки в Telegram: {e}")
+    """QUICK WIN #4: Отправляет сообщение в батч Telegram вместо отправки сразу"""
+    if telegram_batcher:
+        telegram_batcher.add_message(text)
+    else:
+        logger.warning(f"Telegram batcher не инициализирован, пропускаем сообщение")
 
 def validate_signal_with_claude(sig, market_name):
     """Валидация сигнала через LLM."""
-    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "твой_ключ_сюда":
-        return {"decision": "SKIP", "confidence": 0, "reason": "No LLM API key — safe mode enforced"}
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    if not openrouter_key or openrouter_key == "твой_ключ_сюда":
+        if CONFIG.validation.fallback_to_heuristics:
+            # QUICK WIN: Fallback на локальные правила когда нет API ключа
+            confidence = 85 if sig.get("n_wallets", 0) >= 5 else 70
+            return {"decision": "TRADE", "confidence": confidence, "reason": "Local heuristics (no API)"}
+        return {"decision": "SKIP", "confidence": 0, "reason": "No LLM API key"}
     
     prompt = (
         f"Проанализируй сигнал Polymarket: {market_name}. "
@@ -161,16 +147,16 @@ def validate_signal_with_claude(sig, market_name):
     )
     try:
         response = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            CONFIG.api.openrouter_api,
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {openrouter_key}",
                 "Content-Type": "application/json",
             },
             json={
-                "model": "anthropic/claude-3.5-haiku",
+                "model": CONFIG.validation.claude_model,
                 "messages": [{"role": "user", "content": prompt}]
             },
-            timeout=15.0,
+            timeout=CONFIG.validation.claude_timeout,
         )
         if response.status_code == 200:
             content = response.json()["choices"][0]["message"]["content"]
@@ -178,31 +164,41 @@ def validate_signal_with_claude(sig, market_name):
             if match:
                 return json.loads(match.group(0))
         else:
-            print(f"  [!] OpenRouter error {response.status_code}: {response.text}")
+            logger.error(f"OpenRouter error {response.status_code}: {response.text}")
     except Exception as e:
-        print(f"  [!] Claude validation error: {e}")
+        logger.error(f"Claude validation error: {e}")
+    
+    # Fallback на локальные правила при ошибке LLM
+    if CONFIG.validation.fallback_to_heuristics:
+        confidence = 75 if sig.get("n_wallets", 0) >= 3 else 50
+        return {"decision": "TRADE", "confidence": confidence, "reason": "Local heuristics (LLM error)"}
+    
     return {"decision": "SKIP", "confidence": 0, "reason": "LLM error"}
 
 def fetch_trades(limit, timeout=15):
     """Запрос сделок с retry и проверкой ответа."""
     for attempt in range(3):
         try:
-            resp = httpx.get(f"{DATA_API}/trades", params={"limit": limit}, timeout=timeout)
+            resp = httpx.get(
+                f"{CONFIG.api.data_api}/trades",
+                params={"limit": limit},
+                timeout=timeout
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
                     return data
-                print(f"  ⚠️ API вернул неожиданный формат: {type(data)}")
+                logger.warning(f"API вернул неожиданный формат: {type(data)}")
                 return []
             elif resp.status_code == 429:
                 wait = 5 * (attempt + 1)
-                print(f"  ⚠️ Rate limit (429), ждём {wait}с...")
+                logger.warning(f"Rate limit (429), ждём {wait}с...")
                 time.sleep(wait)
             else:
-                print(f"  ⚠️ API вернул {resp.status_code}")
+                logger.warning(f"API вернул {resp.status_code}")
                 return []
         except Exception as e:
-            print(f"  ⚠️ Ошибка сети (попытка {attempt+1}/3): {e}")
+            logger.warning(f"Ошибка сети (попытка {attempt+1}/3): {e}")
             time.sleep(3)
     return []
 
@@ -214,7 +210,10 @@ def fetch_trades(limit, timeout=15):
 def get_market_tokens(condition_id):
     """Получает tokenIds для исходов через CLOB API. Возвращает dict или 'CLOSED'."""
     try:
-        resp = httpx.get(f"{CLOB_API}/markets/{condition_id}", timeout=10)
+        resp = httpx.get(
+            f"{CONFIG.api.clob_api}/markets/{condition_id}",
+            timeout=CONFIG.timeout.market_tokens_timeout
+        )
         if resp.status_code == 200:
             data = resp.json()
             if data.get("closed"):
@@ -225,10 +224,14 @@ def get_market_tokens(condition_id):
                 return {t.get("outcome", "").lower(): t.get("token_id") for t in tokens}
             
             # Fallback на Gamma API если в CLOB нет токенов (редко)
-            print(f"  ⚠️ В CLOB API нет токенов для {condition_id}, пробуем Gamma...")
+            logger.debug(f"В CLOB API нет токенов для {condition_id}, пробуем Gamma...")
         
         # Резервный вариант через Gamma API
-        resp = httpx.get(f"{GAMMA_API}/markets", params={"condition_ids": condition_id}, timeout=10)
+        resp = httpx.get(
+            f"{CONFIG.api.gamma_api}/markets",
+            params={"condition_ids": condition_id},
+            timeout=CONFIG.timeout.market_tokens_timeout
+        )
         if resp.status_code == 200:
             data = resp.json()
             if data:
@@ -239,23 +242,26 @@ def get_market_tokens(condition_id):
                     outcomes = json.loads(m.get("outcomes", '["Yes", "No"]'))
                     return {outcomes[i].lower(): tokens[i] for i in range(len(tokens))}
     except Exception as e:
-        print(f"  [!] Ошибка получения токенов для {condition_id}: {e}")
+        logger.error(f"Ошибка получения токенов для {condition_id}: {e}")
     return None
 
 def get_current_price(token_id):
-    """Запрашивает актуальную цену токена через CLOB API."""
-    try:
-        resp = httpx.get(
-            "https://clob.polymarket.com/price",
-            params={"token_id": token_id, "side": "sell"},
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return float(data.get("price", 0))
-    except Exception:
-        pass
-    return None
+    """QUICK WIN #3: Запрашивает цену с кэшированием (TTL 30 сек)."""
+    def _fetch_price(token_id):
+        try:
+            resp = httpx.get(
+                f"{CONFIG.api.clob_api}/price",
+                params={"token_id": token_id, "side": "sell"},
+                timeout=CONFIG.timeout.price_timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return float(data.get("price", 0))
+        except Exception:
+            pass
+        return None
+    
+    return price_cache.get_price(token_id, _fetch_price)
 
 def get_consensus_outcome(entries, side):
     """Определяет самый популярный outcome среди сделок с данной стороной."""
@@ -344,17 +350,17 @@ def manage_positions():
                 entry = p.get("entry_price", 0)
                 if entry > 0:
                     change = (current_price - entry) / entry
-                    if change >= 0.25:
-                        print(f"✅ Take Profit +25%: закрываем {p['market']}")
+                    if change >= CONFIG.trading.take_profit_pct:
+                        print(f"✅ Take Profit +{CONFIG.trading.take_profit_pct*100:.0f}%: закрываем {p['market']}")
                         close_position(token_id, p["tokens"], current_price)
                         to_delete.append(token_id)
-                        send_telegram(f"✅ <b>TAKE PROFIT +25%:</b> {p['market']}\nЦена выхода: {current_price}")
+                        send_telegram(f"✅ <b>TAKE PROFIT +{CONFIG.trading.take_profit_pct*100:.0f}%:</b> {p['market']}\nЦена выхода: {current_price}")
                         continue
-                    if change <= -0.20:
-                        print(f"🛑 Stop Loss -20%: закрываем {p['market']}")
+                    if change <= CONFIG.trading.stop_loss_pct:
+                        print(f"🛑 Stop Loss {CONFIG.trading.stop_loss_pct*100:.0f}%: закрываем {p['market']}")
                         close_position(token_id, p["tokens"], current_price)
                         to_delete.append(token_id)
-                        send_telegram(f"🛑 <b>STOP LOSS -20%:</b> {p['market']}\nЦена выхода: {current_price}")
+                        send_telegram(f"🛑 <b>STOP LOSS {CONFIG.trading.stop_loss_pct*100:.0f}%:</b> {p['market']}\nЦена выхода: {current_price}")
                         continue
 
             if now > close_at:
@@ -387,19 +393,19 @@ def manage_positions():
 
 def run():
     print("=" * 60)
-    print("  Polymarket Bot v3 — Whale Trader запущен")
+    print("  Polymarket Bot v3 — Whale Trader запущен (с QUICK WINS оптимизациями)")
     print("=" * 60)
 
     try:
-        top_wallets = set(pd.read_csv(TOP_WALLETS)["wallet"].str.lower())
+        top_wallets = set(pd.read_csv(CONFIG.files.top_wallets_path)["wallet"].str.lower())
     except Exception as e:
-        print(f"⚠️ Ошибка загрузки китов ({TOP_WALLETS}): {e}. Ждем появления файла...")
+        logger.warning(f"Ошибка загрузки китов ({CONFIG.files.top_wallets_path}): {e}. Ждем появления файла...")
         top_wallets = set()
 
     seen_hashes = OrderedDict()
     rolling_buffer = []  
     total_signals = 0
-    # NEW-8: кэш позиций в памяти
+    # Кэш позиций в памяти
     cached_positions = load_positions()
 
     while True:
@@ -409,7 +415,7 @@ def run():
             
             cycle_start = datetime.now(timezone.utc)
             now_ts = cycle_start.timestamp()
-            cutoff = now_ts - SIGNAL_WINDOW
+            cutoff = now_ts - CONFIG.monitor.signal_window
 
             limit = 5000 if not seen_hashes else 500
             trades = fetch_trades(limit)
@@ -434,8 +440,8 @@ def run():
                 price = float(t.get("price", 0))
                 size_usdc = float(t.get("size", 0))
                 
-                is_known_whale = wallet in top_wallets and size_usdc >= MIN_SIZE_USDC
-                is_big_trade = size_usdc >= WHALE_MIN_SIZE
+                is_known_whale = wallet in top_wallets and size_usdc >= CONFIG.monitor.min_size_usdc
+                is_big_trade = size_usdc >= CONFIG.monitor.whale_min_size
                 
                 if is_known_whale or is_big_trade:
                     ts_raw = int(t.get("timestamp", 0))
@@ -451,13 +457,13 @@ def run():
                     new_count += 1
 
             # Обрезка seen_hashes (FIFO)
-            while len(seen_hashes) > MAX_SEEN:
+            while len(seen_hashes) > CONFIG.cache.max_seen_hashes:
                 seen_hashes.popitem(last=False)
 
             # Обрезка буфера по времени + лимит
             rolling_buffer = [b for b in rolling_buffer if b["ts"] >= cutoff]
-            if len(rolling_buffer) > MAX_BUFFER:
-                rolling_buffer = rolling_buffer[-MAX_BUFFER:]
+            if len(rolling_buffer) > CONFIG.cache.max_buffer_size:
+                rolling_buffer = rolling_buffer[-CONFIG.cache.max_buffer_size:]
 
             # Группировка по рынку
             market_buckets = defaultdict(list)
@@ -469,17 +475,17 @@ def run():
                     continue
                 
                 market_name = entries[0]["market"]
-                market_lower = market_name.lower()
-                if any(p.lower() in market_lower for p in SKIP_PATTERNS):
+                # QUICK WIN #2: Использует скомпилированный regex вместо O(N) цикла
+                if CONFIG.market_filter.should_skip(market_name):
                     continue
                 
                 buy_w = {e["wallet"] for e in entries if e["side"] == "BUY"}
                 sell_w = {e["wallet"] for e in entries if e["side"] == "SELL"}
                 
                 side = None
-                if len(buy_w) >= len(sell_w) * 2 and len(buy_w) >= MIN_WALLETS:
+                if len(buy_w) >= len(sell_w) * 2 and len(buy_w) >= CONFIG.monitor.min_wallets:
                     side = "BUY"
-                elif len(sell_w) >= len(buy_w) * 2 and len(sell_w) >= MIN_WALLETS:
+                elif len(sell_w) >= len(buy_w) * 2 and len(sell_w) >= CONFIG.monitor.min_wallets:
                     side = "SELL"
                 
                 if not side:
@@ -517,7 +523,7 @@ def run():
                     # NEW-2: медианная цена из нужной стороны
                     trade_price = get_median_price(entries, side)
                     
-                    if trade_price > 0.98:
+                    if trade_price > CONFIG.trading.max_price:
                         trade_status = f"⏭ Пропущен (цена {trade_price:.4f} слишком высока)"
                     elif token_id and 0.01 <= trade_price < 1:
                         action_desc = f"{order_side} (сигнал: {side})"
@@ -528,16 +534,15 @@ def run():
                             trade_status = f"⏭ Пропущен (баланс ${balance:.2f} < $1.00)"
                             print(f"  ⚠️ Недостаточно средств для торговли (баланс: ${balance:.2f}). Жду пополнения.")
                         else:
-                            print(f"💰 Открываем сделку {action_desc} на $2: {market_name} (баланс: ${balance:.2f})")
-                            res = place_bet(token_id, order_side, 2.0, trade_price)
+                            print(f"💰 Открываем сделку {action_desc} на ${CONFIG.trading.trade_amount_usd}: {market_name} (баланс: ${balance:.2f})")
+                            res = place_bet(token_id, order_side, CONFIG.trading.trade_amount_usd, trade_price)
                             if res:
                                 trade_status = f"✅ СДЕЛКА: {action_desc}"
                                 # Динамический расчет как в trader.py
-                                MIN_TOKENS = 5.0
-                                entry_usd = 2.0
+                                entry_usd = CONFIG.trading.trade_amount_usd
                                 entry_tokens = entry_usd / trade_price if trade_price > 0 else 0
-                                if entry_tokens < MIN_TOKENS:
-                                    entry_tokens = MIN_TOKENS
+                                if entry_tokens < CONFIG.trading.min_tokens:
+                                    entry_tokens = CONFIG.trading.min_tokens
                                     entry_usd = entry_tokens * trade_price
                                 
                                 cached_positions[token_id] = {
@@ -548,7 +553,7 @@ def run():
                                     "size_usd": entry_usd,
                                     "tokens": entry_tokens,
                                     "opened_at": datetime.now(timezone.utc).isoformat(),
-                                    "close_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
+                                    "close_at": (datetime.now(timezone.utc) + timedelta(hours=CONFIG.trading.position_hold_hours)).isoformat(),
                                 }
                                 save_positions(cached_positions)
                             else:
@@ -575,7 +580,11 @@ def run():
                 f"Новых: +{new_count}"
             )
             
-            time.sleep(POLL_INTERVAL)
+            # QUICK WIN #4: Проверяем нужно ли отправить батч Telegram
+            if telegram_batcher and telegram_batcher.should_flush():
+                telegram_batcher.flush()
+            
+            time.sleep(CONFIG.monitor.poll_interval)
 
         except Exception as e:
             print(f"Error: {e}")
