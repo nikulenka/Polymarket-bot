@@ -1,0 +1,10 @@
+[Unit]
+Description=Polymarket Whale Scouter (ежедневный пересбор китов, модуль 1)
+
+[Service]
+Type=oneshot
+User=__BOT_USER__
+WorkingDirectory=__BOT_DIR__
+Environment=PYTHONPATH=.
+ExecStart=__BOT_DIR__/.venv/bin/python3 -u -m src.scout
+# Перезапуск трекера не нужен: он перечитывает БД китов каждые 10 минут

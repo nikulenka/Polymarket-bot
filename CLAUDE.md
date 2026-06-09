@@ -70,6 +70,9 @@ python3 -m src.scout
 ./run.sh
 # или: python3 -m src.tracker
 
+# Деплой на Linux-сервер (systemd): см. deploy/DEPLOY.md
+#   sudo bash deploy/install.sh
+
 # Тесты (без API, на моках)
 python3 -m unittest tests.test_bot -v
 ```

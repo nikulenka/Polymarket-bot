@@ -1,0 +1,16 @@
+[Unit]
+Description=Polymarket Whale Tracker (Live Tracker, модуль 2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__BOT_USER__
+WorkingDirectory=__BOT_DIR__
+Environment=PYTHONPATH=.
+ExecStart=__BOT_DIR__/.venv/bin/python3 -u -m src.tracker
+Restart=always
+RestartSec=30
+# Логи дублируются в journald; файловые логи бот пишет сам в logs/
+
+[Install]
+WantedBy=multi-user.target
