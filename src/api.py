@@ -107,6 +107,20 @@ def get_holders(condition_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     return holders
 
 
+def get_leaderboard(rank_type: str = "pnl", window: str = "30d",
+                    limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Топ трейдеров Polymarket (страница /leaderboard).
+    Поля записи: proxyWallet, userName, pnl, vol, rank.
+    API отдаёт максимум 50 записей; параметр window принимается,
+    но (проверено июнь 2026) на выдачу влияет слабо.
+    """
+    data = _get(f"{CONFIG.api.data_api}/v1/leaderboard",
+                {"window": window, "rankType": rank_type, "limit": limit},
+                timeout=CONFIG.timeout.default_timeout)
+    return data if isinstance(data, list) else []
+
+
 def get_first_trade_ts(user: str, max_pages: int = 4) -> Optional[int]:
     """
     Возраст кошелька: timestamp первой сделки (best-effort).

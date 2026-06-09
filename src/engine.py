@@ -57,28 +57,34 @@ class FilterEngine:
     # ---- Консенсус и анализ рынка ------------------------------------------
 
     def evaluate_market(self, entries: List[Dict[str, Any]], now: float,
-                        trusted: set = None) -> Optional[Dict[str, Any]]:
+                        trusted: set = None,
+                        elite: set = None) -> Optional[Dict[str, Any]]:
         """
         Анализирует все сделки одного рынка в окне. Возвращает сигнал или None.
 
         Два режима:
-        - Trusted whale (одиночный): известный кит (в trusted) с notional >= trusted_whale_min_notional
-          → сигнал без ожидания консенсуса. Мы доверяем проверенному WinRate/PnL.
-        - Consensus: 2+ адреса на одной стороне с перевесом 2× — для неизвестных крупных кошельков.
+        - Trusted whale (одиночный): ЭЛИТНЫЙ кит (высокий WinRate/PnL, инсайдер
+          или подтверждённый leaderboard) с notional >= trusted_whale_min_notional
+          → сигнал без ожидания консенсуса.
+        - Consensus: 2+ адреса на одной стороне с перевесом 2× — для остальных
+          отслеживаемых китов (одиночной сделке середняка не доверяем).
 
         entries: dict с ключами wallet, side, price, outcome, notional, market, cond_id, event_slug.
-        trusted:  множество адресов из БД (known whales).
+        trusted: множество адресов из БД (known whales).
+        elite:   подмножество trusted, которому доверяем одиночный сигнал.
+                 Если None — элитой считается весь trusted (обратная совместимость).
         """
         trusted = trusted or set()
+        elite = trusted if elite is None else elite
 
         # Исключаем замьюченных (MEV/арбитраж)
         live = [e for e in entries if not self.is_muted(e["wallet"], now)]
         if not live:
             return None
 
-        # --- Режим 1: одиночный известный кит ---
+        # --- Режим 1: одиночный элитный кит ---
         for e in live:
-            if (e["wallet"] in trusted
+            if (e["wallet"] in elite
                     and e["notional"] >= CONFIG.engine.trusted_whale_min_notional
                     and e["side"] in ("BUY", "SELL")):
                 side = e["side"]

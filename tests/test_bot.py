@@ -73,6 +73,20 @@ class TestScoutScoring(unittest.TestCase):
         with patch.object(api, "get_trades", side_effect=pages):
             self.assertEqual(api.get_first_trade_ts("0xnew"), 1_749_000_000)
 
+    def test_qualifies_leaderboard_whale(self):
+        # Подтверждённый lifetime PnL с leaderboard + мало решённых позиций
+        # в снапшоте (winrate не проверяем — мало данных)
+        w = {"winrate": 0.0, "total_pnl": 50, "resolved_trades": 1,
+             "is_insider": False, "lifetime_pnl": 100_000}
+        self.assertTrue(scout.qualifies(w))
+
+    def test_qualifies_leaderboard_whale_bad_snapshot_blocked(self):
+        # Leaderboard-кит, но снапшот с достаточной статистикой показывает
+        # низкий winrate → блокируем
+        w = {"winrate": 0.20, "total_pnl": -500, "resolved_trades": 40,
+             "is_insider": False, "lifetime_pnl": 100_000}
+        self.assertFalse(scout.qualifies(w))
+
 
 class TestEngine(unittest.TestCase):
     def setUp(self):
@@ -93,11 +107,28 @@ class TestEngine(unittest.TestCase):
 
     def test_trusted_whale_fires_alone(self):
         # Один известный кит с достаточным notional — сигнал без консенсуса
+        # (elite не передан → элитой считается весь trusted)
         trusted = {"trusted_w1"}
         entries = [self._entry("trusted_w1", "BUY", notional=1000)]
         sig = self.eng.evaluate_market(entries, now=1000, trusted=trusted)
         self.assertIsNotNone(sig)
         self.assertEqual(sig["signal_type"], "trusted_whale")
+
+    def test_non_elite_whale_needs_consensus(self):
+        # Отслеживаемый, но НЕ элитный кит в одиночку сигнала не даёт
+        trusted = {"mid_w1"}
+        entries = [self._entry("mid_w1", "BUY", notional=5000)]
+        sig = self.eng.evaluate_market(entries, now=1000, trusted=trusted, elite=set())
+        self.assertIsNone(sig)
+
+    def test_non_elite_whales_fire_by_consensus(self):
+        # Два не-элитных кита на одной стороне → консенсусный сигнал
+        trusted = {"mid_w1", "mid_w2"}
+        entries = [self._entry("mid_w1", "BUY", notional=500),
+                   self._entry("mid_w2", "BUY", notional=500)]
+        sig = self.eng.evaluate_market(entries, now=1000, trusted=trusted, elite=set())
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig["signal_type"], "consensus")
 
     def test_unknown_single_wallet_no_signal(self):
         # Незнакомый кошелёк один — сигнала нет
@@ -183,6 +214,44 @@ class TestDB(unittest.TestCase):
         self.assertFalse(db.tx_seen("0xdead", "Yes"))
         db.record_tx(tx)
         self.assertTrue(db.tx_seen("0xdead", "Yes"))
+
+    def _signal(self, cond_id, wallets, side="BUY", outcome="yes"):
+        sig = {"cond_id": cond_id, "market": "M?", "side": side,
+               "consensus_outcome": outcome, "signal_type": "trusted_whale"}
+        db.record_signal_outcome(sig, wallets, entry_price=0.6)
+
+    def test_signal_outcome_roundtrip_and_attribution(self):
+        self._signal("c1", ["0xAAA"])
+        self._signal("c2", ["0xaaa", "0xbbb"])
+        unresolved = db.get_unresolved_outcomes()
+        self.assertEqual(len(unresolved), 2)
+
+        db.mark_outcome_resolved(unresolved[0]["id"], "yes", won=True)
+        db.mark_outcome_resolved(unresolved[1]["id"], "no", won=False)
+        self.assertEqual(len(db.get_unresolved_outcomes()), 0)
+
+        stats = db.whale_signal_stats()
+        self.assertEqual(stats["0xaaa"], {"resolved": 2, "wins": 1})
+        self.assertEqual(stats["0xbbb"], {"resolved": 1, "wins": 0})
+
+    def test_prune_bad_performers(self):
+        db.upsert_whale({"address": "0xbad", "winrate": 0.8, "total_pnl": 5000})
+        db.upsert_whale({"address": "0xgood", "winrate": 0.8, "total_pnl": 5000})
+        # 0xbad: 5 разрешённых сигналов, 1 победа (20% < 40%) → удаляется
+        for i in range(5):
+            self._signal(f"c{i}", ["0xbad"])
+        # 0xgood: 5 сигналов, 4 победы → остаётся
+        for i in range(5, 10):
+            self._signal(f"c{i}", ["0xgood"])
+        for o in db.get_unresolved_outcomes():
+            is_bad = "0xbad" in o["wallets"]
+            won = (o["id"] % 5 == 0) if is_bad else (o["id"] % 5 != 0)
+            db.mark_outcome_resolved(o["id"], "yes" if won else "no", won=won)
+
+        removed = db.prune_bad_performers(min_signals=5, min_winshare=0.40)
+        self.assertEqual(removed, ["0xbad"])
+        self.assertIsNone(db.get_whale("0xbad"))
+        self.assertIsNotNone(db.get_whale("0xgood"))
 
 
 class TestNotifier(unittest.TestCase):

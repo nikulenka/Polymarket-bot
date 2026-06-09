@@ -40,6 +40,7 @@ src/logger.py   → логирование
 - `/positions` → `realizedPnl + cashPnl` = PnL позиции. Используй для WinRate/PnL скоринга, не парси историю разрешённых рынков через Gamma.
 - `/holders?market=<conditionId>` → топ-холдеры. Сортировка: `order=volumeNum&ascending=false` (не `volume24hr`!).
 - `/value?user=` → текущая стоимость портфеля.
+- `/v1/leaderboard?rankType=pnl` → топ-50 трейдеров по PnL (`proxyWallet`, `userName`, `pnl`). Главный источник «бриллиантовых» китов: PnL там стабильный, в отличие от шумного снапшота `/positions`. Максимум 50 записей, `window` почти не влияет.
 
 ### 3. Конфигурация только через `src/config.py`
 
@@ -165,6 +166,7 @@ whales (
     is_insider INTEGER,    -- 0 / 1
     age_days REAL,
     score REAL,
+    lifetime_pnl REAL,     -- подтверждённый PnL с leaderboard (0 = кит не оттуда)
     first_seen TEXT,       -- ISO timestamp
     created_at TEXT,
     last_active TEXT,
@@ -181,4 +183,19 @@ tx_history (
     price REAL,
     timestamp INTEGER
 )
+
+-- Исходы сигналов: был ли кит прав (петля обратной связи)
+signal_outcomes (
+    id INTEGER PK,
+    cond_id TEXT, market_title TEXT,
+    side TEXT, outcome TEXT,   -- направление сигнала и consensus_outcome
+    entry_price REAL, signal_type TEXT,
+    wallets TEXT,              -- адреса на стороне сигнала, через запятую
+    created_at TEXT,
+    resolved_at TEXT, winner TEXT, won INTEGER  -- NULL пока рынок не разрешён
+)
 ```
+
+**Петля обратной связи:** каждый сигнал пишется в `signal_outcomes` (даже если позиция не открыта — оцениваем кита). `tracker.check_signal_outcomes()` каждые 30 минут сверяет с разрешением рынков; киты с ≥ 5 разрешёнными сигналами и долей правоты < 40% удаляются автоматически (`db.prune_bad_performers`).
+
+**Элита:** одиночный сигнал (без консенсуса) даёт только элитный кит — WinRate ≥ 70% и PnL ≥ $10k, инсайдер или leaderboard-кит (`db.get_elite_addresses`). Остальные отслеживаемые — только консенсусом 2+.

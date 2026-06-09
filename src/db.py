@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS whales (
     is_insider       INTEGER DEFAULT 0,
     age_days         REAL,
     score            REAL DEFAULT 0,
+    lifetime_pnl     REAL DEFAULT 0,
     first_seen       TEXT,
     created_at       TEXT,
     last_active      TEXT,
@@ -48,8 +49,26 @@ CREATE TABLE IF NOT EXISTS tx_history (
     PRIMARY KEY (tx_hash, outcome)
 );
 
+-- Исходы сигналов: был ли кит прав. Основа авточистки плохих китов
+-- и оценки качества стратегии (Фаза 2).
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    cond_id       TEXT,
+    market_title  TEXT,
+    side          TEXT,            -- BUY / SELL (направление сигнала)
+    outcome       TEXT,            -- consensus_outcome сигнала (lower)
+    entry_price   REAL,            -- цена на момент сигнала
+    signal_type   TEXT,            -- trusted_whale / consensus
+    wallets       TEXT,            -- адреса на стороне сигнала, через запятую
+    created_at    TEXT,
+    resolved_at   TEXT,            -- NULL пока рынок не разрешён
+    winner        TEXT,            -- выигравший outcome (lower)
+    won           INTEGER          -- 1 = кит был прав, 0 = нет, NULL = не разрешён
+);
+
 CREATE INDEX IF NOT EXISTS idx_whales_insider ON whales(is_insider);
 CREATE INDEX IF NOT EXISTS idx_tx_address ON tx_history(address);
+CREATE INDEX IF NOT EXISTS idx_outcomes_unresolved ON signal_outcomes(resolved_at) WHERE resolved_at IS NULL;
 """
 
 
@@ -66,9 +85,14 @@ def _conn():
 
 
 def init_db() -> None:
-    """Создаёт таблицы если их нет."""
+    """Создаёт таблицы если их нет + миграции существующей БД."""
     with _conn() as con:
         con.executescript(SCHEMA)
+        # Миграция: lifetime_pnl появился в Фазе 2
+        try:
+            con.execute("ALTER TABLE whales ADD COLUMN lifetime_pnl REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
     logger.info(f"DB готова: {CONFIG.files.db_path}")
 
 
@@ -91,10 +115,10 @@ def upsert_whale(w: Dict[str, Any]) -> None:
             """
             INSERT INTO whales
                 (address, pseudonym, winrate, total_pnl, portfolio_value,
-                 resolved_trades, is_insider, age_days, score,
+                 resolved_trades, is_insider, age_days, score, lifetime_pnl,
                  first_seen, created_at, last_active, last_scored)
             VALUES (:address, :pseudonym, :winrate, :total_pnl, :portfolio_value,
-                    :resolved_trades, :is_insider, :age_days, :score,
+                    :resolved_trades, :is_insider, :age_days, :score, :lifetime_pnl,
                     :first_seen, :created_at, :last_active, :last_scored)
             ON CONFLICT(address) DO UPDATE SET
                 pseudonym=excluded.pseudonym,
@@ -105,6 +129,7 @@ def upsert_whale(w: Dict[str, Any]) -> None:
                 is_insider=excluded.is_insider,
                 age_days=excluded.age_days,
                 score=excluded.score,
+                lifetime_pnl=excluded.lifetime_pnl,
                 last_scored=excluded.last_scored
             """,
             {
@@ -117,6 +142,7 @@ def upsert_whale(w: Dict[str, Any]) -> None:
                 "is_insider": 1 if w.get("is_insider") else 0,
                 "age_days": w.get("age_days"),
                 "score": w.get("score", 0),
+                "lifetime_pnl": w.get("lifetime_pnl", 0),
                 "first_seen": first_seen,
                 "created_at": w.get("created_at", first_seen),
                 "last_active": w.get("last_active", _now()),
@@ -158,11 +184,14 @@ def touch_last_active(address: str) -> None:
 
 def remove_unqualified_whales(min_winrate: float, min_pnl: float,
                               insider_min_winrate: float,
-                              insider_min_pnl: float = 0.0) -> int:
+                              insider_min_pnl: float = 0.0,
+                              lb_min_pnl: float = float("inf"),
+                              lb_min_winrate: float = 0.0,
+                              lb_min_resolved_for_check: int = 0) -> int:
     """
     Удаляет из БД китов, которые больше не соответствуют критериям.
     Вызывается в конце каждого прогона скаута после изменения порогов.
-    Условия зеркалят scout.qualifies().
+    Условия зеркалят scout.qualifies(): бриллиант ИЛИ инсайдер ИЛИ leaderboard-кит.
     """
     with _conn() as con:
         result = con.execute(
@@ -170,10 +199,12 @@ def remove_unqualified_whales(min_winrate: float, min_pnl: float,
             DELETE FROM whales
             WHERE NOT (
                 (winrate >= ? AND total_pnl >= ?) OR
-                (is_insider = 1 AND winrate >= ? AND total_pnl > ?)
+                (is_insider = 1 AND winrate >= ? AND total_pnl > ?) OR
+                (lifetime_pnl >= ? AND (resolved_trades < ? OR winrate >= ?))
             )
             """,
-            (min_winrate, min_pnl, insider_min_winrate, insider_min_pnl),
+            (min_winrate, min_pnl, insider_min_winrate, insider_min_pnl,
+             lb_min_pnl, lb_min_resolved_for_check, lb_min_winrate),
         )
         removed = result.rowcount
     if removed:
@@ -181,13 +212,32 @@ def remove_unqualified_whales(min_winrate: float, min_pnl: float,
     return removed
 
 
+def get_elite_addresses(min_winrate: float, min_pnl: float,
+                        lb_min_pnl: float) -> Set[str]:
+    """
+    «Элита» — киты, которым доверяем одиночный сигнал без консенсуса:
+    высокий WinRate + PnL, инсайдеры, либо подтверждённый lifetime PnL с leaderboard.
+    """
+    with _conn() as con:
+        rows = con.execute(
+            """
+            SELECT address FROM whales
+            WHERE (winrate >= ? AND (total_pnl >= ? OR lifetime_pnl >= ?))
+               OR is_insider = 1
+               OR lifetime_pnl >= ?
+            """,
+            (min_winrate, min_pnl, min_pnl, lb_min_pnl),
+        ).fetchall()
+    return {r["address"].lower() for r in rows}
+
+
 def export_whales_csv(path: Optional[str] = None) -> int:
     """Экспорт китов в CSV (обзор/совместимость). Колонка `wallet` для старого кода."""
     path = path or CONFIG.files.top_wallets_path
     whales = get_all_whales()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    cols = ["wallet", "pseudonym", "winrate", "total_pnl", "portfolio_value",
-            "resolved_trades", "is_insider", "age_days", "score"]
+    cols = ["wallet", "pseudonym", "winrate", "total_pnl", "lifetime_pnl",
+            "portfolio_value", "resolved_trades", "is_insider", "age_days", "score"]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=cols)
         writer.writeheader()
@@ -197,6 +247,7 @@ def export_whales_csv(path: Optional[str] = None) -> int:
                 "pseudonym": w.get("pseudonym", ""),
                 "winrate": round(w.get("winrate", 0), 4),
                 "total_pnl": round(w.get("total_pnl", 0), 2),
+                "lifetime_pnl": round(w.get("lifetime_pnl", 0) or 0, 2),
                 "portfolio_value": round(w.get("portfolio_value", 0), 2),
                 "resolved_trades": w.get("resolved_trades", 0),
                 "is_insider": w.get("is_insider", 0),
@@ -217,6 +268,99 @@ def tx_seen(tx_hash: str, outcome: str) -> bool:
             (tx_hash, outcome),
         ).fetchone()
     return row is not None
+
+
+# ============================================================
+#  signal_outcomes — был ли кит прав (петля обратной связи, Фаза 2)
+# ============================================================
+
+def record_signal_outcome(signal: Dict[str, Any], wallets: List[str],
+                          entry_price: float) -> None:
+    """Фиксирует сигнал для последующей сверки с разрешением рынка."""
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO signal_outcomes
+                (cond_id, market_title, side, outcome, entry_price,
+                 signal_type, wallets, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal.get("cond_id", ""),
+                signal.get("market", ""),
+                signal.get("side", ""),
+                (signal.get("consensus_outcome") or "").lower(),
+                entry_price,
+                signal.get("signal_type", ""),
+                ",".join(sorted(set(w.lower() for w in wallets))),
+                _now(),
+            ),
+        )
+
+
+def get_unresolved_outcomes(limit: int = 100) -> List[Dict[str, Any]]:
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM signal_outcomes WHERE resolved_at IS NULL "
+            "ORDER BY created_at LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_outcome_resolved(outcome_id: int, winner: str, won: bool) -> None:
+    with _conn() as con:
+        con.execute(
+            "UPDATE signal_outcomes SET resolved_at = ?, winner = ?, won = ? WHERE id = ?",
+            (_now(), winner, 1 if won else 0, outcome_id),
+        )
+
+
+def whale_signal_stats() -> Dict[str, Dict[str, int]]:
+    """
+    Атрибуция по китам: сколько разрешённых сигналов с участием кошелька
+    и сколько из них оказались верными. {address: {"resolved": n, "wins": k}}
+    """
+    stats: Dict[str, Dict[str, int]] = {}
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT wallets, won FROM signal_outcomes WHERE resolved_at IS NOT NULL"
+        ).fetchall()
+    for r in rows:
+        for addr in (r["wallets"] or "").split(","):
+            addr = addr.strip().lower()
+            if not addr:
+                continue
+            s = stats.setdefault(addr, {"resolved": 0, "wins": 0})
+            s["resolved"] += 1
+            s["wins"] += int(r["won"] or 0)
+    return stats
+
+
+def prune_bad_performers(min_signals: int, min_winshare: float) -> List[str]:
+    """
+    Удаляет китов, чьи скопированные сигналы статистически убыточны:
+    >= min_signals разрешённых сигналов и доля правоты < min_winshare.
+    История в signal_outcomes сохраняется. Возвращает удалённые адреса.
+    """
+    stats = whale_signal_stats()
+    bad = [
+        addr for addr, s in stats.items()
+        if s["resolved"] >= min_signals
+        and (s["wins"] / s["resolved"]) < min_winshare
+    ]
+    if not bad:
+        return []
+    with _conn() as con:
+        removed = []
+        for addr in bad:
+            r = con.execute("DELETE FROM whales WHERE address = ?", (addr,))
+            if r.rowcount:
+                removed.append(addr)
+    if removed:
+        logger.info(f"Авточистка по исходам сигналов: удалено {len(removed)} китов: "
+                    + ", ".join(a[:10] + "…" for a in removed))
+    return removed
 
 
 def record_tx(t: Dict[str, Any]) -> None:

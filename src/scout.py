@@ -63,8 +63,13 @@ def _score_positions(positions: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def score_wallet(address: str, pseudonym: str = "") -> Dict[str, Any]:
-    """Полный скоринг одного кошелька. Возвращает запись для БД (без фильтрации)."""
+def score_wallet(address: str, pseudonym: str = "",
+                 lifetime_pnl: float = 0.0) -> Dict[str, Any]:
+    """
+    Полный скоринг одного кошелька. Возвращает запись для БД (без фильтрации).
+    lifetime_pnl — подтверждённый PnL с leaderboard (0, если кошелёк не оттуда):
+    он стабильнее шумного снапшота /positions.
+    """
     positions = api.get_positions(address)
     stats = _score_positions(positions)
     portfolio = api.get_portfolio_value(address)
@@ -83,8 +88,10 @@ def score_wallet(address: str, pseudonym: str = "") -> Dict[str, Any]:
         and stats["volume"] > CONFIG.scout.insider_min_volume
     )
 
-    # Скор для ранжирования: нормированный PnL + WinRate + бонус инсайдеру
-    pnl_norm = min(stats["total_pnl"] / max(CONFIG.scout.min_total_pnl, 1), 3.0)
+    # Скор для ранжирования: нормированный PnL (лучший из снапшота и lifetime)
+    # + WinRate + бонус инсайдеру
+    best_pnl = max(stats["total_pnl"], lifetime_pnl)
+    pnl_norm = min(best_pnl / max(CONFIG.scout.min_total_pnl, 1), 3.0)
     score = pnl_norm * 0.5 + stats["winrate"] * 0.4 + (0.5 if is_insider else 0.0)
 
     return {
@@ -92,6 +99,7 @@ def score_wallet(address: str, pseudonym: str = "") -> Dict[str, Any]:
         "pseudonym": pseudonym,
         "winrate": stats["winrate"],
         "total_pnl": stats["total_pnl"],
+        "lifetime_pnl": lifetime_pnl,
         "portfolio_value": portfolio,
         "resolved_trades": stats["resolved_trades"],
         "is_insider": is_insider,
@@ -102,7 +110,7 @@ def score_wallet(address: str, pseudonym: str = "") -> Dict[str, Any]:
 
 
 def qualifies(w: Dict[str, Any]) -> bool:
-    """Проходит ли кошелёк критерии отбора (бриллиант ИЛИ инсайдер)."""
+    """Проходит ли кошелёк критерии отбора (бриллиант / инсайдер / leaderboard-кит)."""
     diamond = (
         w["winrate"] >= CONFIG.scout.min_winrate
         and w["total_pnl"] >= CONFIG.scout.min_total_pnl
@@ -114,12 +122,49 @@ def qualifies(w: Dict[str, Any]) -> bool:
         and w["winrate"] >= CONFIG.scout.insider_min_winrate
         and w["total_pnl"] > CONFIG.scout.insider_min_pnl
     )
-    return bool(diamond or quality_insider)
+    # Leaderboard-кит: подтверждённый lifetime PnL. Снапшот-winrate проверяем
+    # только когда решённых позиций достаточно для статистики.
+    lb_whale = (
+        w.get("lifetime_pnl", 0) >= CONFIG.scout.lb_min_pnl
+        and (
+            w["resolved_trades"] < CONFIG.scout.lb_min_resolved_for_check
+            or w["winrate"] >= CONFIG.scout.lb_min_winrate
+        )
+    )
+    return bool(diamond or quality_insider or lb_whale)
+
+
+def collect_leaderboard() -> Dict[str, Dict[str, Any]]:
+    """
+    Кандидаты с официального leaderboard (топ по PnL) — главный источник
+    «бриллиантовых» китов: PnL там lifetime/оконный и стабильный, в отличие
+    от шумного снапшота /positions.
+    Возвращает {address: {"pseudonym": str, "lifetime_pnl": float}}.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in api.get_leaderboard(rank_type="pnl",
+                                   limit=CONFIG.scout.leaderboard_limit):
+        addr = (row.get("proxyWallet") or "").lower()
+        if not addr:
+            continue
+        try:
+            pnl = float(row.get("pnl", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if pnl >= CONFIG.scout.lb_min_pnl:
+            out[addr] = {
+                "pseudonym": row.get("userName", "") or "",
+                "lifetime_pnl": pnl,
+            }
+    logger.info(f"Кандидатов с leaderboard (PnL >= ${CONFIG.scout.lb_min_pnl:,.0f}): {len(out)}")
+    return out
 
 
 def collect_candidates() -> Dict[str, str]:
     """
     Собирает кандидатов из ленты активных сделок (не из топ-холдеров).
+    Лента нужна в первую очередь для ИНСАЙДЕРОВ — молодых кошельков,
+    которых на leaderboard ещё нет.
 
     Проблема топ-холдеров: они держат открытые позиции в нерешённых рынках,
     поэтому у них 0 resolved_trades и PnL отражает только текущий убыток.
@@ -167,27 +212,41 @@ def run_scout() -> int:
     print("  WHALE SCOUTER — активные трейдеры из ленты сделок")
     print("=" * 60)
 
-    candidates = collect_candidates()
-    print(f"Уникальных кандидатов: {len(candidates)} (из последних {CONFIG.scout.trade_feed_pages * 500} сделок)")
+    lb = collect_leaderboard()
+    feed = collect_candidates()
+    # Объединяем: leaderboard-киты первыми, лента добавляет новых (инсайдеров)
+    merged: Dict[str, Dict[str, Any]] = {
+        addr: info for addr, info in lb.items()
+    }
+    for addr, pseudonym in feed.items():
+        merged.setdefault(addr, {"pseudonym": pseudonym, "lifetime_pnl": 0.0})
+    print(f"Кандидатов: {len(merged)} (leaderboard: {len(lb)}, лента сделок: {len(feed)})")
 
     added = 0
-    for i, (addr, pseudonym) in enumerate(candidates.items(), 1):
+    for i, (addr, info) in enumerate(merged.items(), 1):
         try:
-            w = score_wallet(addr, pseudonym)
+            w = score_wallet(addr, info["pseudonym"],
+                             lifetime_pnl=info["lifetime_pnl"])
             if qualifies(w):
                 db.upsert_whale(w)
                 added += 1
-                tag = "🥷 INSIDER" if w["is_insider"] else "💎 WHALE"
+                if w["is_insider"]:
+                    tag = "🥷 INSIDER"
+                elif w["lifetime_pnl"] >= CONFIG.scout.lb_min_pnl:
+                    tag = "🏆 LEADERBOARD"
+                else:
+                    tag = "💎 WHALE"
                 age_str = f" age={w['age_days']:.0f}д" if w["age_days"] is not None else ""
+                lb_str = f" lbPnL=${w['lifetime_pnl']:,.0f}" if w["lifetime_pnl"] else ""
                 print(
                     f"  {tag} {addr[:8]}… "
                     f"WinRate={w['winrate']*100:.0f}% "
-                    f"PnL=${w['total_pnl']:,.0f}{age_str}"
+                    f"PnL=${w['total_pnl']:,.0f}{lb_str}{age_str}"
                 )
         except Exception as e:
             logger.warning(f"Скоринг {addr[:10]} упал: {e}")
         if i % 25 == 0:
-            print(f"  …обработано {i}/{len(candidates)} кандидатов")
+            print(f"  …обработано {i}/{len(merged)} кандидатов")
 
     # Удаляем устаревшие записи, которые не проходят текущие критерии
     removed = db.remove_unqualified_whales(
@@ -195,6 +254,9 @@ def run_scout() -> int:
         min_pnl=CONFIG.scout.min_total_pnl,
         insider_min_winrate=CONFIG.scout.insider_min_winrate,
         insider_min_pnl=CONFIG.scout.insider_min_pnl,
+        lb_min_pnl=CONFIG.scout.lb_min_pnl,
+        lb_min_winrate=CONFIG.scout.lb_min_winrate,
+        lb_min_resolved_for_check=CONFIG.scout.lb_min_resolved_for_check,
     )
     if removed:
         print(f"  🗑  Удалено {removed} устаревших китов (не прошли текущие критерии)")

@@ -67,7 +67,11 @@ class Notifier:
         if not whales:
             return "крупные сделки (не из списка отслеживаемых)"
         best_wr = max((w.get("winrate", 0) for w in whales), default=0) * 100
-        total_pnl = sum(w.get("total_pnl", 0) for w in whales)
+        # PnL кита: лучший из снапшота /positions и lifetime с leaderboard
+        total_pnl = sum(
+            max(w.get("total_pnl", 0) or 0, w.get("lifetime_pnl", 0) or 0)
+            for w in whales
+        )
         insiders = [w for w in whales if w.get("is_insider")]
         parts = [f"WinRate до {best_wr:.0f}%", f"PnL ${total_pnl:,.0f}"]
         if insiders:

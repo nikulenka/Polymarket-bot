@@ -85,6 +85,16 @@ class ScoutConfig:
     # Анти-бот при скоринге
     max_market_diversity: int = 60   # слишком много разных рынков = бот/биржа
 
+    # Leaderboard как источник китов (lifetime PnL вместо шумного снапшота /positions)
+    leaderboard_limit: int = 50      # API отдаёт максимум 50
+    lb_min_pnl: float = 25_000.0     # кит с leaderboard: PnL >= $25k
+    lb_min_winrate: float = 0.50     # sanity-проверка по снапшоту /positions
+    lb_min_resolved_for_check: int = 5  # если решённых позиций меньше — winrate не проверяем (мало данных)
+
+    # Авточистка по исходам скопированных сигналов (signal_outcomes)
+    prune_min_signals: int = 5       # минимум разрешённых сигналов для оценки кита
+    prune_min_winshare: float = 0.40 # доля правоты ниже → кит удаляется из БД
+
 
 @dataclass
 class EngineConfig:
@@ -100,6 +110,12 @@ class EngineConfig:
     # Порог для одиночного алерта по известному киту (без консенсуса).
     # По требованиям — $1,000: копировать каждую мелкую сделку кита убыточно.
     trusted_whale_min_notional: float = 1_000.0
+    # Одиночный сигнал — только от «элитного» кита (высокий winrate/PnL или инсайдер).
+    # Остальные отслеживаемые киты дают сигнал только консенсусом (2+ кошелька).
+    elite_min_winrate: float = 0.70
+    elite_min_pnl: float = 10_000.0
+    # Как часто проверять разрешение рынков по записанным сигналам (сек)
+    outcome_check_interval: int = 1800
 
 
 @dataclass

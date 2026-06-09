@@ -332,6 +332,55 @@ def execute_trade(signal, positions):
 
 
 # ============================================================
+#  Петля обратной связи: исходы сигналов → авточистка китов
+# ============================================================
+
+def _load_elite():
+    return db.get_elite_addresses(
+        min_winrate=CONFIG.engine.elite_min_winrate,
+        min_pnl=CONFIG.engine.elite_min_pnl,
+        lb_min_pnl=CONFIG.scout.lb_min_pnl,
+    )
+
+
+def check_signal_outcomes():
+    """
+    Сверяет записанные сигналы с разрешением рынков (был ли кит прав)
+    и удаляет китов со статистически убыточными сигналами.
+    Возвращает список удалённых адресов.
+    """
+    unresolved = db.get_unresolved_outcomes()
+    if not unresolved:
+        return []
+    resolved_n = 0
+    for o in unresolved:
+        if not o.get("cond_id"):
+            continue
+        winner = api.get_market_resolution(o["cond_id"])
+        if winner is None:
+            continue  # рынок ещё не разрешён
+        bet = (o.get("outcome") or "").lower()
+        # BUY → кит прав, если его исход выиграл; SELL → если исход проиграл
+        won = (winner == bet) if o.get("side") == "BUY" else (winner != bet)
+        db.mark_outcome_resolved(o["id"], winner, won)
+        resolved_n += 1
+
+    if not resolved_n:
+        return []
+    logger.info(f"Исходы сигналов: сверено {resolved_n} разрешённых рынков")
+    removed = db.prune_bad_performers(
+        min_signals=CONFIG.scout.prune_min_signals,
+        min_winshare=CONFIG.scout.prune_min_winshare,
+    )
+    if removed:
+        notifier.send(
+            "🗑 <b>Авточистка китов</b> (сигналы статистически убыточны):\n"
+            + "\n".join(f"<code>{a}</code>" for a in removed)
+        )
+    return removed
+
+
+# ============================================================
 #  Главный цикл
 # ============================================================
 
@@ -342,15 +391,17 @@ def run():
 
     db.init_db()
     tracked = db.get_tracked_addresses()
+    elite = _load_elite()
     if not tracked:
         logger.warning("В БД нет китов! Сначала запусти скаут: PYTHONPATH=. python3 -m src.scout")
-    print(f"Отслеживаемых китов: {len(tracked)}")
+    print(f"Отслеживаемых китов: {len(tracked)} (элитных: {len(elite)})")
 
     seen = OrderedDict()
     buffer = []
     total_signals = 0
     positions = load_positions()
     last_whale_reload = time.time()
+    last_outcome_check = 0.0
 
     while True:
         try:
@@ -360,7 +411,15 @@ def run():
             # Перечитываем список китов раз в 10 минут (скаут мог обновить БД)
             if time.time() - last_whale_reload > 600:
                 tracked = db.get_tracked_addresses()
+                elite = _load_elite()
                 last_whale_reload = time.time()
+
+            # Сверка исходов сигналов + авточистка плохих китов
+            if time.time() - last_outcome_check > CONFIG.engine.outcome_check_interval:
+                last_outcome_check = time.time()
+                if check_signal_outcomes():
+                    tracked = db.get_tracked_addresses()
+                    elite = _load_elite()
 
             now_ts = datetime.now(timezone.utc).timestamp()
             cutoff = now_ts - CONFIG.monitor.signal_window
@@ -424,7 +483,7 @@ def run():
                 if CONFIG.market_filter.should_skip(entries[0]["market"]):
                     continue
 
-                signal = engine.evaluate_market(entries, now_ts, trusted=tracked)
+                signal = engine.evaluate_market(entries, now_ts, trusted=tracked, elite=elite)
                 if not signal:
                     continue
 
@@ -438,6 +497,11 @@ def run():
                 side_wallets = {e["wallet"] for e in entries if e["side"] == signal["side"]}
                 whale_stats = [db.get_whale(w) for w in side_wallets]
                 whale_stats = [w for w in whale_stats if w]
+
+                # Петля обратной связи: фиксируем сигнал для сверки с исходом рынка.
+                # Пишем независимо от того, откроем ли позицию — оцениваем КИТА.
+                db.record_signal_outcome(signal, sorted(side_wallets),
+                                         entry_price=signal["median_price"])
 
                 # tx_history (антидубль + история по схеме из требований)
                 for e in entries:
