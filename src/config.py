@@ -64,18 +64,21 @@ class MonitorConfig:
 class ScoutConfig:
     """Конфигурация Whale Scouter (модуль 1) — критерии из требований."""
     # Критерии «бриллиантового» кошелька
-    min_winrate: float = 0.80        # WinRate >= 80%
-    min_total_pnl: float = 100_000.0 # Total PnL >= $100k
-    min_resolved_trades: int = 5     # минимум разрешённых позиций для значимости WinRate
+    # /positions — snapshot текущего портфеля, не lifetime история.
+    # Поэтому реалистичные (не aspirational) пороги:
+    min_winrate: float = 0.55        # WinRate >= 55% (чуть выше случайного)
+    min_total_pnl: float = 1_000.0   # Total PnL >= $1k (хотя бы один крупный правильный бет)
+    min_resolved_trades: int = 2     # минимум 2 разрешённых позиции
 
-    # Инсайдерский паттерн: молодой кошелёк с крупным объёмом
-    insider_max_age_days: int = 14   # кошелёк создан < 14 дней назад
-    insider_min_volume: float = 10_000.0  # но объём сделок > $10k
+    # Инсайдерский паттерн: молодой кошелёк с КРУПНЫМ объёмом и хоть какими победами
+    insider_max_age_days: int = 7    # кошелёк < 7 дней
+    insider_min_volume: float = 50_000.0   # объём > $50k — только серьёзные игроки
+    insider_min_winrate: float = 0.25      # хотя бы 25% побед — фильтр чистых лузеров
 
-    # Сканирование рынков (Top Holders)
-    min_market_liquidity: float = 500_000.0  # фокус на пулах > $500k
-    markets_to_scan: int = 40        # сколько топ-рынков сканировать за прогон
-    holders_per_market: int = 50     # сколько топ-холдеров брать на рынок
+    # Стратегия: кандидаты из ленты активных сделок (вместо топ-холдеров)
+    trade_feed_pages: int = 10       # страниц по 500 сделок = 5000 сделок
+    trade_min_notional: float = 200.0  # min $200 на сделку — отсекаем мелочь
+    max_candidates: int = 300        # максимум уникальных адресов за прогон
 
     # Анти-бот при скоринге
     max_market_diversity: int = 60   # слишком много разных рынков = бот/биржа
@@ -85,13 +88,15 @@ class ScoutConfig:
 class EngineConfig:
     """Конфигурация Filter Engine (модуль 3) — анти-шум и риск."""
     consensus_dominance: float = 2.0     # одна сторона должна превышать другую в N раз
-    min_alert_notional: float = 1_000.0  # алерт только если ставка кита > $1000
+    min_alert_notional: float = 200.0   # консенсус: суммарный объём группы > $200
     # Анти-MEV/арбитраж: если кошелёк делает > N сделок за окно — мьютим
     mev_max_trades_per_window: int = 50
     mev_window_sec: int = 60
     mev_mute_sec: int = 3600             # на сколько мьютим бота
     # Дельта-нейтрал: помечаем рынки где одни киты в YES, другие в NO одновременно
     flag_delta_neutral: bool = True
+    # Порог для одиночного алерта по известному киту (без консенсуса)
+    trusted_whale_min_notional: float = 100.0  # $100+ от проверенного кита → сразу алерт
 
 
 @dataclass
@@ -160,12 +165,17 @@ class MarketFilterConfig:
     def __post_init__(self):
         if self.skip_patterns is None:
             self.skip_patterns = [
-                "NBA", "NFL", "NHL", "MLB", "soccer", "win the",
+                "NBA", "NFL", "NHL", "MLB", "soccer",
                 "beat the", "Series", "Finals", "Championship",
                 "Buccaneers", "Lakers", "Spurs", "Hawks", "Knicks",
                 "Celtics", "Warriors", "Nuggets", "Playoffs",
                 "AM-", "PM-", "AM ET", "PM ET", ":00AM", ":00PM",
                 "Up or Down -", "updown", "Up or Down,",
+                "Spread:", "Spread -", "moneyline", "Over/Under",
+                "1st Half", "2nd Half", "1H ", "2H ", "Live:",
+                " win on ", " beat ", " score more ",
+                "CONCACAF", "CONMEBOL", "UEFA", "FIFA", "AFCON", "Copa",
+                "World Cup", "Olympic", "Tour de France", "Grand Prix", "Formula 1",
                 " vs ", " vs. ", " FC ", " United ", " Real ", " City ", " Atletico ",
                 "Madrid Open", "Tennis", "ATP", "WTA", "Winner", "Map 1", "Map 2",
                 "Counter-Strike", "CS2", "Dota", "Esports", "UFC", "MMA", "Boxing",

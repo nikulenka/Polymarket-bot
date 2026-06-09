@@ -56,18 +56,47 @@ class FilterEngine:
 
     # ---- Консенсус и анализ рынка ------------------------------------------
 
-    def evaluate_market(self, entries: List[Dict[str, Any]], now: float) -> Optional[Dict[str, Any]]:
+    def evaluate_market(self, entries: List[Dict[str, Any]], now: float,
+                        trusted: set = None) -> Optional[Dict[str, Any]]:
         """
         Анализирует все сделки одного рынка в окне. Возвращает сигнал или None.
 
-        entries: dict с ключами wallet, side, price, outcome, notional, market,
-                 cond_id, event_slug.
+        Два режима:
+        - Trusted whale (одиночный): известный кит (в trusted) с notional >= trusted_whale_min_notional
+          → сигнал без ожидания консенсуса. Мы доверяем проверенному WinRate/PnL.
+        - Consensus: 2+ адреса на одной стороне с перевесом 2× — для неизвестных крупных кошельков.
+
+        entries: dict с ключами wallet, side, price, outcome, notional, market, cond_id, event_slug.
+        trusted:  множество адресов из БД (known whales).
         """
+        trusted = trusted or set()
+
         # Исключаем замьюченных (MEV/арбитраж)
         live = [e for e in entries if not self.is_muted(e["wallet"], now)]
         if not live:
             return None
 
+        # --- Режим 1: одиночный известный кит ---
+        for e in live:
+            if (e["wallet"] in trusted
+                    and e["notional"] >= CONFIG.engine.trusted_whale_min_notional
+                    and e["side"] in ("BUY", "SELL")):
+                side = e["side"]
+                side_entries = [x for x in live if x["side"] == side]
+                return {
+                    "side": side,
+                    "n_wallets": len({x["wallet"] for x in side_entries}),
+                    "total_notional": sum(x["notional"] for x in side_entries),
+                    "consensus_outcome": self._consensus_outcome(live, side),
+                    "median_price": self._median_price(live, side),
+                    "delta_neutral": self._is_delta_neutral(live),
+                    "market": e.get("market", ""),
+                    "cond_id": e.get("cond_id", ""),
+                    "event_slug": e.get("event_slug", ""),
+                    "signal_type": "trusted_whale",
+                }
+
+        # --- Режим 2: консенсус (2+ кошельков) ---
         buy_w = {e["wallet"] for e in live if e["side"] == "BUY"}
         sell_w = {e["wallet"] for e in live if e["side"] == "SELL"}
 
@@ -85,7 +114,6 @@ class FilterEngine:
         side_entries = [e for e in live if e["side"] == side]
         total_notional = sum(e["notional"] for e in side_entries)
 
-        # Калькулятор объёма: алерт только при достаточном объёме
         if total_notional < CONFIG.engine.min_alert_notional:
             return None
 
@@ -99,6 +127,7 @@ class FilterEngine:
             "market": live[0].get("market", ""),
             "cond_id": live[0].get("cond_id", ""),
             "event_slug": live[0].get("event_slug", ""),
+            "signal_type": "consensus",
         }
 
     @staticmethod

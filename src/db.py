@@ -156,6 +156,29 @@ def touch_last_active(address: str) -> None:
         )
 
 
+def remove_unqualified_whales(min_winrate: float, min_pnl: float,
+                              insider_min_winrate: float) -> int:
+    """
+    Удаляет из БД китов, которые больше не соответствуют критериям.
+    Вызывается в конце каждого прогона скаута после изменения порогов.
+    """
+    with _conn() as con:
+        result = con.execute(
+            """
+            DELETE FROM whales
+            WHERE NOT (
+                (winrate >= ? AND total_pnl >= ?) OR
+                (is_insider = 1 AND winrate >= ?)
+            )
+            """,
+            (min_winrate, min_pnl, insider_min_winrate),
+        )
+        removed = result.rowcount
+    if removed:
+        logger.info(f"Удалено {removed} китов, не прошедших текущие критерии.")
+    return removed
+
+
 def export_whales_csv(path: Optional[str] = None) -> int:
     """Экспорт китов в CSV (обзор/совместимость). Колонка `wallet` для старого кода."""
     path = path or CONFIG.files.top_wallets_path

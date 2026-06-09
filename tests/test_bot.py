@@ -43,8 +43,14 @@ class TestScoutScoring(unittest.TestCase):
         self.assertFalse(scout.qualifies(w))
 
     def test_qualifies_insider_overrides(self):
-        w = {"winrate": 0.0, "total_pnl": 0, "resolved_trades": 0, "is_insider": True}
+        # Инсайдер должен иметь минимальный WinRate (insider_min_winrate)
+        w = {"winrate": CONFIG.scout.insider_min_winrate, "total_pnl": 0, "resolved_trades": 0, "is_insider": True}
         self.assertTrue(scout.qualifies(w))
+
+    def test_qualifies_insider_pure_loser_blocked(self):
+        # Новый кошелёк с 0% побед — не инсайдер, а просто убыточный новичок
+        w = {"winrate": 0.0, "total_pnl": -100_000, "resolved_trades": 0, "is_insider": True}
+        self.assertFalse(scout.qualifies(w))
 
 
 class TestEngine(unittest.TestCase):
@@ -62,23 +68,36 @@ class TestEngine(unittest.TestCase):
         self.assertIsNotNone(sig)
         self.assertEqual(sig["side"], "BUY")
         self.assertEqual(sig["n_wallets"], 3)
+        self.assertEqual(sig["signal_type"], "consensus")
+
+    def test_trusted_whale_fires_alone(self):
+        # Один известный кит с достаточным notional — сигнал без консенсуса
+        trusted = {"trusted_w1"}
+        entries = [self._entry("trusted_w1", "BUY", notional=1000)]
+        sig = self.eng.evaluate_market(entries, now=1000, trusted=trusted)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig["signal_type"], "trusted_whale")
+
+    def test_unknown_single_wallet_no_signal(self):
+        # Незнакомый кошелёк один — сигнала нет
+        entries = [self._entry("unknown_w", "BUY", notional=5000)]
+        self.assertIsNone(self.eng.evaluate_market(entries, now=1000, trusted=set()))
 
     def test_no_signal_below_min_wallets(self):
-        entries = [self._entry("w1", "BUY")]  # 1 < min_wallets(2)
-        self.assertIsNone(self.eng.evaluate_market(entries, now=1000))
+        entries = [self._entry("w1", "BUY")]  # 1 < min_wallets(2), не trusted
+        self.assertIsNone(self.eng.evaluate_market(entries, now=1000, trusted=set()))
 
     def test_volume_threshold_blocks_small(self):
         entries = [self._entry(f"w{i}", "BUY", notional=10) for i in range(3)]  # 30 < $1000
-        self.assertIsNone(self.eng.evaluate_market(entries, now=1000))
+        self.assertIsNone(self.eng.evaluate_market(entries, now=1000, trusted=set()))
 
     def test_mev_mute(self):
         w = "bot1"
         for i in range(CONFIG.engine.mev_max_trades_per_window):
             self.eng.observe(w, ts=1000 + i * 0.1)
         self.assertTrue(self.eng.is_muted(w, now=1000))
-        # замьюченный кит исключается из консенсуса
         entries = [self._entry(w, "BUY") for _ in range(3)]
-        self.assertIsNone(self.eng.evaluate_market(entries, now=1000))
+        self.assertIsNone(self.eng.evaluate_market(entries, now=1000, trusted={w}))
 
     def test_delta_neutral_flag(self):
         entries = [self._entry("w1", "BUY", outcome="yes"),

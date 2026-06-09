@@ -85,8 +85,11 @@ class Notifier:
         market = escape(signal.get("market", "")[:120])
         url = self.market_url(signal)
 
+        signal_type = signal.get("signal_type", "consensus")
+        type_label = "💎 Trusted Whale" if signal_type == "trusted_whale" else "🤝 Консенсус"
+
         lines = [
-            f"🚨 <b>СИГНАЛ #{n}</b>",
+            f"🚨 <b>СИГНАЛ #{n}</b> [{type_label}]",
             f'<a href="{url}">{market}</a>',
             f"Киты {action} <b>{escape(str(outcome).upper())}</b> ({side}) — {signal['n_wallets']} кош.",
             f"💰 Объём: ${signal['total_notional']:,.0f} | Цена входа: {signal['median_price']:.3f}",

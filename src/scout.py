@@ -1,8 +1,10 @@
 """
 Модуль 1 — Whale Scouter.
 
-Сканирует топ-холдеров ликвидных рынков, считает по каждому кандидату
-WinRate / Total PnL / возраст и наполняет БД «бриллиантовыми» кошельками.
+Источник кандидатов: лента активных сделок /trades (НЕ топ-холдеры рынков).
+Почему: топ-холдеры держат открытые позиции в нерешённых рынках → мало resolved_trades
+и PnL отражает только текущий unrealized убыток. Активные трейдеры имеют реальную
+торговую историю по многим рынкам, что даёт репрезентативный WinRate/PnL.
 
 Критерии (docs/Requirements Polymarket.md):
   • «Бриллиантовый» кит: WinRate >= 80% И Total PnL >= $100k (при >= N разрешённых позициях)
@@ -104,29 +106,54 @@ def qualifies(w: Dict[str, Any]) -> bool:
         and w["total_pnl"] >= CONFIG.scout.min_total_pnl
         and w["resolved_trades"] >= CONFIG.scout.min_resolved_trades
     )
-    return bool(diamond or w["is_insider"])
+    # Инсайдер должен иметь минимальный WinRate — отсекаем новых лузеров/ботов
+    quality_insider = (
+        w["is_insider"]
+        and w["winrate"] >= CONFIG.scout.insider_min_winrate
+    )
+    return bool(diamond or quality_insider)
 
 
 def collect_candidates() -> Dict[str, str]:
-    """Собирает уникальных кандидатов (address -> pseudonym) из топ-холдеров ликвидных рынков."""
-    markets = api.get_liquid_markets(
-        limit=CONFIG.scout.markets_to_scan,
-        min_liquidity=CONFIG.scout.min_market_liquidity,
-    )
-    logger.info(f"Ликвидных рынков для сканирования: {len(markets)}")
+    """
+    Собирает кандидатов из ленты активных сделок (не из топ-холдеров).
 
+    Проблема топ-холдеров: они держат открытые позиции в нерешённых рынках,
+    поэтому у них 0 resolved_trades и PnL отражает только текущий убыток.
+    Активные трейдеры из /trades feed имеют реальную торговую историю
+    с разнообразием рынков → /positions покажет реальный WinRate/PnL.
+    """
     candidates: Dict[str, str] = {}
-    for m in markets:
-        cid = m.get("conditionId")
-        if not cid:
-            continue
-        if CONFIG.market_filter.should_skip(m.get("question", "")):
-            continue
-        holders = api.get_holders(cid, limit=CONFIG.scout.holders_per_market)
-        for h in holders:
-            addr = (h.get("proxyWallet") or "").lower()
-            if addr:
-                candidates.setdefault(addr, h.get("pseudonym", ""))
+    wallet_markets: Dict[str, set] = {}
+
+    for page in range(CONFIG.scout.trade_feed_pages):
+        batch = api.get_trades(limit=500, offset=page * 500)
+        if not batch:
+            break
+        for t in batch:
+            addr = (t.get("proxyWallet") or "").lower()
+            if not addr:
+                continue
+            # Не фильтруем по теме рынка здесь: кошелёк может торговать
+            # и в спорте и в политике — скоринг сам оценит по /positions.
+            if api.usdc_notional(t) < CONFIG.scout.trade_min_notional:
+                continue
+
+            if addr not in wallet_markets:
+                wallet_markets[addr] = set()
+            wallet_markets[addr].add(t.get("conditionId", ""))
+
+            # Слишком много разных рынков = биржа/арбитраж-бот
+            if len(wallet_markets[addr]) > CONFIG.scout.max_market_diversity:
+                continue
+
+            candidates.setdefault(addr, t.get("pseudonym", "") or "")
+            if len(candidates) >= CONFIG.scout.max_candidates:
+                break
+        if len(candidates) >= CONFIG.scout.max_candidates:
+            break
+
+    logger.info(f"Кандидатов из ленты торгов (последние {CONFIG.scout.trade_feed_pages * 500} сделок): {len(candidates)}")
     return candidates
 
 
@@ -134,11 +161,11 @@ def run_scout() -> int:
     """Полный прогон скаута. Возвращает число добавленных/обновлённых китов."""
     db.init_db()
     print("=" * 60)
-    print("  WHALE SCOUTER — поиск умных денег")
+    print("  WHALE SCOUTER — активные трейдеры из ленты сделок")
     print("=" * 60)
 
     candidates = collect_candidates()
-    print(f"Уникальных кандидатов: {len(candidates)}")
+    print(f"Уникальных кандидатов: {len(candidates)} (из последних {CONFIG.scout.trade_feed_pages * 500} сделок)")
 
     added = 0
     for i, (addr, pseudonym) in enumerate(candidates.items(), 1):
@@ -158,6 +185,15 @@ def run_scout() -> int:
             logger.warning(f"Скоринг {addr[:10]} упал: {e}")
         if i % 25 == 0:
             print(f"  …обработано {i}/{len(candidates)} кандидатов")
+
+    # Удаляем устаревшие записи, которые не проходят текущие критерии
+    removed = db.remove_unqualified_whales(
+        min_winrate=CONFIG.scout.min_winrate,
+        min_pnl=CONFIG.scout.min_total_pnl,
+        insider_min_winrate=CONFIG.scout.insider_min_winrate,
+    )
+    if removed:
+        print(f"  🗑  Удалено {removed} устаревших китов (не прошли текущие критерии)")
 
     count = db.export_whales_csv()
     print(f"\n✓ Отобрано китов: {added}. Всего в БД: {count}")

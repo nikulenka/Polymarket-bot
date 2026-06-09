@@ -172,6 +172,7 @@ def manage_positions():
         for tid in to_delete:
             positions.pop(tid, None)
         save_positions(positions)
+        notifier.flush()  # TP/SL/timeout — тоже немедленно
 
 
 # ============================================================
@@ -314,7 +315,7 @@ def run():
                 if CONFIG.market_filter.should_skip(entries[0]["market"]):
                     continue
 
-                signal = engine.evaluate_market(entries, now_ts)
+                signal = engine.evaluate_market(entries, now_ts, trusted=tracked)
                 if not signal:
                     continue
 
@@ -345,6 +346,7 @@ def run():
                 total_signals += 1
                 msg = notifier.format_signal(total_signals, signal, whale_stats, trade_status)
                 notifier.send(msg)
+                notifier.flush()  # сигнал → немедленная доставка, не ждём батч-таймер
                 logger.info(" | ".join(msg.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","").split("\n")))
                 print(f"\n{'='*50}\n{msg}\n{'='*50}\n")
 
