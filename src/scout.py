@@ -69,7 +69,9 @@ def score_wallet(address: str, pseudonym: str = "") -> Dict[str, Any]:
     stats = _score_positions(positions)
     portfolio = api.get_portfolio_value(address)
 
-    # Возраст кошелька (для инсайдерского фильтра)
+    # Возраст кошелька (для инсайдерского фильтра).
+    # get_first_trade_ts вернёт None, если история глубже лимита пагинации —
+    # такой кошелёк не может считаться «молодым» (возраст неизвестен).
     age_days = None
     first_ts = api.get_first_trade_ts(address)
     if first_ts:
@@ -106,10 +108,11 @@ def qualifies(w: Dict[str, Any]) -> bool:
         and w["total_pnl"] >= CONFIG.scout.min_total_pnl
         and w["resolved_trades"] >= CONFIG.scout.min_resolved_trades
     )
-    # Инсайдер должен иметь минимальный WinRate — отсекаем новых лузеров/ботов
+    # Инсайдер должен выигрывать И быть в плюсе — отсекаем новых лузеров/ботов
     quality_insider = (
         w["is_insider"]
         and w["winrate"] >= CONFIG.scout.insider_min_winrate
+        and w["total_pnl"] > CONFIG.scout.insider_min_pnl
     )
     return bool(diamond or quality_insider)
 
@@ -191,6 +194,7 @@ def run_scout() -> int:
         min_winrate=CONFIG.scout.min_winrate,
         min_pnl=CONFIG.scout.min_total_pnl,
         insider_min_winrate=CONFIG.scout.insider_min_winrate,
+        insider_min_pnl=CONFIG.scout.insider_min_pnl,
     )
     if removed:
         print(f"  🗑  Удалено {removed} устаревших китов (не прошли текущие критерии)")

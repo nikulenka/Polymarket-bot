@@ -111,8 +111,11 @@ def get_first_trade_ts(user: str, max_pages: int = 4) -> Optional[int]:
     """
     Возраст кошелька: timestamp первой сделки (best-effort).
     Data API отдаёт сделки от свежих к старым — пагинируем до конца или до max_pages.
-    Если страницы кончились раньше — это точный первый трейд; если упёрлись в
-    max_pages — это верхняя граница возраста (кошелёк точно не «молодой»).
+
+    Возвращает точный timestamp первого трейда, только если история исчерпана
+    в пределах max_pages. Если упёрлись в лимит — возвращает None («возраст
+    неизвестен»): у гиперактивного бота все 2000 последних сделок могут быть
+    за последние сутки, и min(timestamp) ложно пометил бы его «молодым инсайдером».
     """
     oldest: Optional[int] = None
     offset = 0
@@ -120,14 +123,14 @@ def get_first_trade_ts(user: str, max_pages: int = 4) -> Optional[int]:
     for _ in range(max_pages):
         batch = get_trades(limit=page, user=user, offset=offset)
         if not batch:
-            break
+            return oldest
         ts_values = [int(t.get("timestamp", 0)) for t in batch if t.get("timestamp")]
         if ts_values:
             oldest = min(ts_values) if oldest is None else min(oldest, min(ts_values))
         if len(batch) < page:
-            break
+            return oldest
         offset += page
-    return oldest
+    return None  # история глубже max_pages — возраст неизвестен
 
 
 # ============================================================
@@ -225,17 +228,17 @@ def _fetch_price(token_id: str, side: str = "sell") -> Optional[float]:
     return None
 
 
-# Кэш цен (TTL из конфига)
-_price_cache: Dict[str, tuple] = {}
+# Кэш цен (TTL из конфига), ключ — (token_id, side): bid и ask не смешиваем
+_price_cache: Dict[tuple, tuple] = {}
 
 
 def get_price(token_id: str, side: str = "sell") -> Optional[float]:
-    """Цена токена с TTL-кэшем."""
+    """Цена токена с TTL-кэшем. side='sell' — bid (для выхода), 'buy' — ask (для входа)."""
     now = time.time()
-    cached = _price_cache.get(token_id)
+    cached = _price_cache.get((token_id, side))
     if cached and now - cached[1] < CONFIG.cache.price_cache_ttl_sec:
         return cached[0]
     price = _fetch_price(token_id, side)
     if price is not None:
-        _price_cache[token_id] = (price, now)
+        _price_cache[(token_id, side)] = (price, now)
     return price

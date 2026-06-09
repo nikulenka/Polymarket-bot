@@ -114,21 +114,30 @@ def resolve_token_id(tokens_map, target_outcome, signal_side):
     """
     BUY-сигнал → покупаем токен target_outcome.
     SELL-сигнал → покупаем ПРОТИВОПОЛОЖНЫЙ (шортить на Polymarket нельзя).
+    Возвращает (token_id, outcome) купленного исхода — outcome нужен,
+    чтобы при разрешении рынка определить выигрыш. Или (None, None).
     """
     if not tokens_map or not target_outcome:
-        return None
+        return None, None
     target = target_outcome.lower()
     if signal_side == "BUY":
-        return tokens_map.get(target) or tokens_map.get("yes")
+        if target in tokens_map:
+            return tokens_map[target], target
+        if "yes" in tokens_map:
+            return tokens_map["yes"], "yes"
+        return None, None
     # SELL → противоположный
     opposite = {k: v for k, v in tokens_map.items() if k != target}
     if "no" in opposite and target == "yes":
-        return opposite["no"]
+        return opposite["no"], "no"
     if "yes" in opposite and target == "no":
-        return opposite["yes"]
+        return opposite["yes"], "yes"
     if len(opposite) == 1:
-        return next(iter(opposite.values()))
-    return tokens_map.get("no")
+        outcome = next(iter(opposite))
+        return opposite[outcome], outcome
+    if "no" in tokens_map:
+        return tokens_map["no"], "no"
+    return None, None
 
 
 def _close_msg(label: str, p: dict, entry: float, exit_price: float, balance: float) -> str:
@@ -162,8 +171,21 @@ def _close_msg(label: str, p: dict, entry: float, exit_price: float, balance: fl
     )
 
 
+def _settle_resolved(token_id: str, p: dict, exit_price: float) -> bool:
+    """
+    Закрытие позиции в разрешённом рынке.
+    Paper — виртуальный SELL по 1.0/0.0. Live — продать разрешённый токен
+    через CLOB нельзя (нужен redeem через CTF) → снимаем с трекинга,
+    redeem делается вручную/отдельным шагом.
+    """
+    if CONFIG.trading.paper_mode:
+        return close_position(token_id, p["tokens"], exit_price)
+    logger.warning(f"LIVE: рынок разрешился — redeem вручную: {p.get('market', '')[:80]}")
+    return True
+
+
 def manage_positions():
-    """TP / SL / выход по времени."""
+    """TP / SL / выход по времени / закрытие по исходу разрешённого рынка."""
     positions = load_positions()
     if not positions:
         return
@@ -179,16 +201,32 @@ def manage_positions():
             entry = p.get("entry_price", 0)
 
             if cur is None:
-                # 404 = токен исчез из CLOB → рынок разрешился раньше нашего close_at.
-                # Закрываем по цене входа (PnL = 0, консервативно).
-                if close_position(token_id, p["tokens"], entry):
-                    to_delete.append(token_id)
-                    bal = get_usdc_balance()
-                    notifier.send(_close_msg("⏰ РЫНОК РАЗРЕШИЛСЯ", p, entry, entry, bal))
+                # 404 = токен исчез из CLOB → рынок, скорее всего, разрешился.
+                # Узнаём исход через Gamma и закрываем по 1.0/0.0 — НЕ по входу,
+                # иначе все выигрыши фиксируются как PnL=0, а убытки — как убытки.
+                winner = api.get_market_resolution(p.get("cond_id", "")) if p.get("cond_id") else None
+                bought = (p.get("outcome") or "").lower()
+                if winner is not None and bought:
+                    won = (winner == bought)
+                    exit_price = 1.0 if won else 0.0
+                    label = "✅ РЫНОК ВЫИГРАЛ" if won else "❌ РЫНОК ПРОИГРАЛ"
+                    if _settle_resolved(token_id, p, exit_price):
+                        to_delete.append(token_id)
+                        bal = get_usdc_balance()
+                        notifier.send(_close_msg(label, p, entry, exit_price, bal))
+                else:
+                    # Исход ещё не известен (или позиция без cond_id — старый формат).
+                    # Ждём grace-период после close_at, потом закрываем нейтрально.
+                    grace = timedelta(hours=CONFIG.trading.resolution_grace_hours)
+                    if now > close_at + grace:
+                        if close_position(token_id, p["tokens"], entry):
+                            to_delete.append(token_id)
+                            bal = get_usdc_balance()
+                            notifier.send(_close_msg("⏰ РЫНОК РАЗРЕШИЛСЯ (исход неизвестен)", p, entry, entry, bal))
                 continue
 
             if entry > 0:
-                # Бинарный рынок разрешился: цена у 1.0 (WIN) или 0.0 (LOSS)
+                # Бинарный рынок фактически решён: цена у 1.0 (WIN) или 0.0 (LOSS)
                 if cur >= 0.97:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
@@ -202,14 +240,16 @@ def manage_positions():
                         notifier.send(_close_msg("❌ РЫНОК ПРОИГРАЛ", p, entry, cur, bal))
                     continue
 
-                change = (cur - entry) / entry
-                if change >= CONFIG.trading.take_profit_pct:
+                # TP/SL в пунктах вероятности: на бинарном рынке проценты от цены
+                # не работают (при входе 0.9 даже +25% недостижимы).
+                change = cur - entry
+                if change >= CONFIG.trading.take_profit_delta:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
                         bal = get_usdc_balance()
                         notifier.send(_close_msg("✅ TAKE PROFIT", p, entry, cur, bal))
                     continue
-                if change <= CONFIG.trading.stop_loss_pct:
+                if change <= CONFIG.trading.stop_loss_delta:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
                         bal = get_usdc_balance()
@@ -238,12 +278,10 @@ def manage_positions():
 def execute_trade(signal, positions):
     """Пробует открыть позицию по сигналу. Возвращает строку-статус."""
     cond_id = signal["cond_id"]
-    price = signal["median_price"]
+    whale_price = signal["median_price"]
 
-    if price > CONFIG.trading.max_price:
-        return f"⏭ Пропуск (цена {price:.3f} > {CONFIG.trading.max_price})"
-    if not (0.01 <= price < 1):
-        return "⏭ Пропуск (цена вне диапазона)"
+    if not (0.01 <= whale_price < 1):
+        return "⏭ Пропуск (цена кита вне диапазона)"
 
     tokens_map = api.get_market_tokens(cond_id)
     if tokens_map == "CLOSED":
@@ -251,9 +289,22 @@ def execute_trade(signal, positions):
     if not tokens_map:
         return "⏭ Пропуск (нет TokenID)"
 
-    token_id = resolve_token_id(tokens_map, signal["consensus_outcome"], signal["side"])
+    token_id, bought_outcome = resolve_token_id(tokens_map, signal["consensus_outcome"], signal["side"])
     if not token_id:
         return "⏭ Пропуск (не нашли токен)"
+
+    # Входим по ТЕКУЩЕМУ ask, а не по цене сделки кита (ей может быть до 12 часов).
+    price = api.get_price(token_id, side="buy")
+    if price is None or not (0.01 <= price < 1):
+        return "⏭ Пропуск (нет цены в стакане)"
+    if price > CONFIG.trading.max_price:
+        return f"⏭ Пропуск (цена {price:.3f} > {CONFIG.trading.max_price})"
+
+    # Цена кита указана для исхода из сигнала; при SELL мы покупаем
+    # противоположный токен, его справедливая цена ≈ 1 − цена кита.
+    ref_price = whale_price if signal["side"] == "BUY" else 1.0 - whale_price
+    if price - ref_price > CONFIG.trading.max_entry_slippage:
+        return f"⏭ Пропуск (поезд ушёл: кит входил ~{ref_price:.3f}, сейчас {price:.3f})"
 
     balance = get_usdc_balance()
     if balance < 1.0:
@@ -267,6 +318,8 @@ def execute_trade(signal, positions):
     tokens = max(entry_usd / price, CONFIG.trading.min_tokens) if price > 0 else CONFIG.trading.min_tokens
     positions[token_id] = {
         "market": signal["market"],
+        "cond_id": cond_id,
+        "outcome": bought_outcome,
         "signal_side": signal["side"],
         "entry_price": price,
         "size_usd": round(tokens * price, 2),
@@ -275,7 +328,7 @@ def execute_trade(signal, positions):
         "close_at": (datetime.now(timezone.utc) + timedelta(hours=CONFIG.trading.position_hold_hours)).isoformat(),
     }
     save_positions(positions)
-    return f"✅ {mode}: BUY {tokens:.1f} шеров @ {price:.3f}"
+    return f"✅ {mode}: BUY {tokens:.1f} шеров «{bought_outcome}» @ {price:.3f}"
 
 
 # ============================================================

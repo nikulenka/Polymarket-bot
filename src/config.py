@@ -70,10 +70,12 @@ class ScoutConfig:
     min_total_pnl: float = 1_000.0   # Total PnL >= $1k (хотя бы один крупный правильный бет)
     min_resolved_trades: int = 2     # минимум 2 разрешённых позиции
 
-    # Инсайдерский паттерн: молодой кошелёк с КРУПНЫМ объёмом и хоть какими победами
+    # Инсайдерский паттерн: молодой кошелёк с КРУПНЫМ объёмом и положительным результатом.
+    # Возраст должен быть ТОЧНЫМ (история исчерпана в get_first_trade_ts), иначе не инсайдер.
     insider_max_age_days: int = 7    # кошелёк < 7 дней
     insider_min_volume: float = 50_000.0   # объём > $50k — только серьёзные игроки
-    insider_min_winrate: float = 0.25      # хотя бы 25% побед — фильтр чистых лузеров
+    insider_min_winrate: float = 0.50      # инсайдер должен выигрывать, а не просто торговать
+    insider_min_pnl: float = 0.0           # PnL строго > этого значения (убыточных не копируем)
 
     # Стратегия: кандидаты из ленты активных сделок (вместо топ-холдеров)
     trade_feed_pages: int = 10       # страниц по 500 сделок = 5000 сделок
@@ -95,8 +97,9 @@ class EngineConfig:
     mev_mute_sec: int = 3600             # на сколько мьютим бота
     # Дельта-нейтрал: помечаем рынки где одни киты в YES, другие в NO одновременно
     flag_delta_neutral: bool = True
-    # Порог для одиночного алерта по известному киту (без консенсуса)
-    trusted_whale_min_notional: float = 100.0  # $100+ от проверенного кита → сразу алерт
+    # Порог для одиночного алерта по известному киту (без консенсуса).
+    # По требованиям — $1,000: копировать каждую мелкую сделку кита убыточно.
+    trusted_whale_min_notional: float = 1_000.0
 
 
 @dataclass
@@ -106,10 +109,14 @@ class TradingConfig:
     paper_start_balance: float = 1000.0  # стартовый банкролл для симуляции
     trade_amount_usd: float = 2.0
     min_tokens: float = 5.0           # минимум токенов для CLOB
-    take_profit_pct: float = 0.25     # +25%
-    stop_loss_pct: float = -0.20      # -20%
+    # TP/SL в ПУНКТАХ ВЕРОЯТНОСТИ (центах), не в % от цены: на бинарном рынке
+    # +25% от 0.9 недостижимы (цена ограничена 1.0), а пункты работают на любой цене.
+    take_profit_delta: float = 0.10   # +10 центов вероятности
+    stop_loss_delta: float = -0.15    # -15 центов вероятности
     position_hold_hours: int = 24
-    max_price: float = 0.98           # не входить выше этой цены
+    max_price: float = 0.80           # выше — апсайд мизерный при риске -100%
+    max_entry_slippage: float = 0.05  # рынок убежал от цены кита > чем на 5 центов → пропуск
+    resolution_grace_hours: int = 24  # ждём разрешения рынка после close_at, прежде чем закрыть по входу
 
 
 @dataclass
@@ -231,6 +238,10 @@ def load_config() -> BotConfig:
     config.scout.min_winrate = _env_float("SCOUT_MIN_WINRATE", config.scout.min_winrate)
     config.scout.min_total_pnl = _env_float("SCOUT_MIN_PNL", config.scout.min_total_pnl)
     config.engine.min_alert_notional = _env_float("MIN_ALERT_NOTIONAL", config.engine.min_alert_notional)
+    config.engine.trusted_whale_min_notional = _env_float(
+        "TRUSTED_WHALE_MIN_NOTIONAL", config.engine.trusted_whale_min_notional)
+    config.trading.max_price = _env_float("MAX_PRICE", config.trading.max_price)
+    config.trading.max_entry_slippage = _env_float("MAX_ENTRY_SLIPPAGE", config.trading.max_entry_slippage)
 
     return config
 

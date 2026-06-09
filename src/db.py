@@ -157,10 +157,12 @@ def touch_last_active(address: str) -> None:
 
 
 def remove_unqualified_whales(min_winrate: float, min_pnl: float,
-                              insider_min_winrate: float) -> int:
+                              insider_min_winrate: float,
+                              insider_min_pnl: float = 0.0) -> int:
     """
     Удаляет из БД китов, которые больше не соответствуют критериям.
     Вызывается в конце каждого прогона скаута после изменения порогов.
+    Условия зеркалят scout.qualifies().
     """
     with _conn() as con:
         result = con.execute(
@@ -168,10 +170,10 @@ def remove_unqualified_whales(min_winrate: float, min_pnl: float,
             DELETE FROM whales
             WHERE NOT (
                 (winrate >= ? AND total_pnl >= ?) OR
-                (is_insider = 1 AND winrate >= ?)
+                (is_insider = 1 AND winrate >= ? AND total_pnl > ?)
             )
             """,
-            (min_winrate, min_pnl, insider_min_winrate),
+            (min_winrate, min_pnl, insider_min_winrate, insider_min_pnl),
         )
         removed = result.rowcount
     if removed:

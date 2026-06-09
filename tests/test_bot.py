@@ -43,14 +43,35 @@ class TestScoutScoring(unittest.TestCase):
         self.assertFalse(scout.qualifies(w))
 
     def test_qualifies_insider_overrides(self):
-        # Инсайдер должен иметь минимальный WinRate (insider_min_winrate)
-        w = {"winrate": CONFIG.scout.insider_min_winrate, "total_pnl": 0, "resolved_trades": 0, "is_insider": True}
+        # Инсайдер: достаточный WinRate И положительный PnL
+        w = {"winrate": CONFIG.scout.insider_min_winrate, "total_pnl": 5_000,
+             "resolved_trades": 0, "is_insider": True}
         self.assertTrue(scout.qualifies(w))
 
     def test_qualifies_insider_pure_loser_blocked(self):
         # Новый кошелёк с 0% побед — не инсайдер, а просто убыточный новичок
         w = {"winrate": 0.0, "total_pnl": -100_000, "resolved_trades": 0, "is_insider": True}
         self.assertFalse(scout.qualifies(w))
+
+    def test_qualifies_insider_negative_pnl_blocked(self):
+        # Регрессия: «инсайдер» с WinRate 60%, но PnL −$126k не должен проходить
+        w = {"winrate": 0.6, "total_pnl": -126_909, "resolved_trades": 355, "is_insider": True}
+        self.assertFalse(scout.qualifies(w))
+
+    def test_first_trade_ts_unknown_when_capped(self):
+        # Гиперактивный кошелёк: все страницы полные → возраст неизвестен (None),
+        # а не «минимум из последних 2000 сделок» (ложный молодой инсайдер)
+        from unittest.mock import patch
+        full_page = [{"timestamp": 1_750_000_000 + i} for i in range(500)]
+        with patch.object(api, "get_trades", return_value=full_page):
+            self.assertIsNone(api.get_first_trade_ts("0xbot", max_pages=4))
+
+    def test_first_trade_ts_exact_when_history_ends(self):
+        # История исчерпана (короткая последняя страница) → точный первый трейд
+        from unittest.mock import patch
+        pages = [[{"timestamp": 1_750_000_000}, {"timestamp": 1_749_000_000}], []]
+        with patch.object(api, "get_trades", side_effect=pages):
+            self.assertEqual(api.get_first_trade_ts("0xnew"), 1_749_000_000)
 
 
 class TestEngine(unittest.TestCase):
@@ -105,6 +126,25 @@ class TestEngine(unittest.TestCase):
                    self._entry("w3", "BUY", outcome="no")]
         sig = self.eng.evaluate_market(entries, now=1000)
         self.assertTrue(sig["delta_neutral"])
+
+
+class TestResolveToken(unittest.TestCase):
+    TOKENS = {"yes": "tok_yes", "no": "tok_no"}
+
+    def test_buy_returns_target_outcome(self):
+        from src.tracker import resolve_token_id
+        token, outcome = resolve_token_id(self.TOKENS, "Yes", "BUY")
+        self.assertEqual((token, outcome), ("tok_yes", "yes"))
+
+    def test_sell_returns_opposite_outcome(self):
+        # Кит продал YES → мы покупаем NO и помним, что купили именно NO
+        from src.tracker import resolve_token_id
+        token, outcome = resolve_token_id(self.TOKENS, "Yes", "SELL")
+        self.assertEqual((token, outcome), ("tok_no", "no"))
+
+    def test_missing_map_returns_none_pair(self):
+        from src.tracker import resolve_token_id
+        self.assertEqual(resolve_token_id({}, "Yes", "BUY"), (None, None))
 
 
 class TestMarketFilter(unittest.TestCase):
