@@ -131,6 +131,37 @@ def resolve_token_id(tokens_map, target_outcome, signal_side):
     return tokens_map.get("no")
 
 
+def _close_msg(label: str, p: dict, entry: float, exit_price: float, balance: float) -> str:
+    """Сообщение о закрытии позиции с P&L и состоянием счёта."""
+    tokens = p.get("tokens", 0)
+    cost = tokens * entry
+    proceeds = tokens * exit_price
+    pnl = proceeds - cost
+    pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+    start = CONFIG.trading.paper_start_balance
+    total_pnl = balance - start
+    pnl_sign = "+" if pnl >= 0 else ""
+    total_sign = "+" if total_pnl >= 0 else ""
+    mode = "PAPER" if CONFIG.trading.paper_mode else "LIVE"
+    market = p.get("market", "")[:80]
+
+    logger.info(
+        f"{label} [{mode}] | {market} | "
+        f"{entry:.3f}→{exit_price:.3f} | P&L: {pnl_sign}{pnl:.2f}$ ({pnl_sign}{pnl_pct:.1f}%) | "
+        f"баланс ${balance:.2f} (итого {total_sign}{total_pnl:.2f}$)"
+    )
+
+    from html import escape
+    market = escape(market)
+    return (
+        f"<b>{label}</b> [{mode}]\n"
+        f"{market}\n"
+        f"Вход: {entry:.3f} → Выход: {exit_price:.3f}\n"
+        f"P&L: <b>{pnl_sign}{pnl:.2f}$</b> ({pnl_sign}{pnl_pct:.1f}%)\n"
+        f"💼 Баланс: ${balance:.2f} (итого {total_sign}{total_pnl:.2f}$ от старта)"
+    )
+
+
 def manage_positions():
     """TP / SL / выход по времени."""
     positions = load_positions()
@@ -147,24 +178,49 @@ def manage_positions():
             cur = api.get_price(token_id)
             entry = p.get("entry_price", 0)
 
-            if cur is not None and entry > 0:
+            if cur is None:
+                # 404 = токен исчез из CLOB → рынок разрешился раньше нашего close_at.
+                # Закрываем по цене входа (PnL = 0, консервативно).
+                if close_position(token_id, p["tokens"], entry):
+                    to_delete.append(token_id)
+                    bal = get_usdc_balance()
+                    notifier.send(_close_msg("⏰ РЫНОК РАЗРЕШИЛСЯ", p, entry, entry, bal))
+                continue
+
+            if entry > 0:
+                # Бинарный рынок разрешился: цена у 1.0 (WIN) или 0.0 (LOSS)
+                if cur >= 0.97:
+                    if close_position(token_id, p["tokens"], cur):
+                        to_delete.append(token_id)
+                        bal = get_usdc_balance()
+                        notifier.send(_close_msg("✅ РЫНОК ВЫИГРАЛ", p, entry, cur, bal))
+                    continue
+                if cur <= 0.03:
+                    if close_position(token_id, p["tokens"], cur):
+                        to_delete.append(token_id)
+                        bal = get_usdc_balance()
+                        notifier.send(_close_msg("❌ РЫНОК ПРОИГРАЛ", p, entry, cur, bal))
+                    continue
+
                 change = (cur - entry) / entry
                 if change >= CONFIG.trading.take_profit_pct:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
-                        notifier.send(f"✅ <b>TAKE PROFIT +{CONFIG.trading.take_profit_pct*100:.0f}%</b>: {p['market']} @ {cur:.3f}")
+                        bal = get_usdc_balance()
+                        notifier.send(_close_msg("✅ TAKE PROFIT", p, entry, cur, bal))
                     continue
                 if change <= CONFIG.trading.stop_loss_pct:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
-                        notifier.send(f"🛑 <b>STOP LOSS {CONFIG.trading.stop_loss_pct*100:.0f}%</b>: {p['market']} @ {cur:.3f}")
+                        bal = get_usdc_balance()
+                        notifier.send(_close_msg("🛑 STOP LOSS", p, entry, cur, bal))
                     continue
 
             if now > close_at:
-                exit_price = cur if cur is not None else entry
-                if close_position(token_id, p["tokens"], exit_price):
+                if close_position(token_id, p["tokens"], cur):
                     to_delete.append(token_id)
-                    notifier.send(f"⏰ <b>ВРЕМЯ ВЫШЛО</b>: {p['market']} @ {exit_price:.3f}")
+                    bal = get_usdc_balance()
+                    notifier.send(_close_msg("⏰ ВРЕМЯ ВЫШЛО", p, entry, cur, bal))
         except Exception as e:
             logger.error(f"manage_positions {token_id}: {e}")
 

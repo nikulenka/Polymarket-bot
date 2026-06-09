@@ -176,6 +176,13 @@ class MarketFilterConfig:
                 " win on ", " beat ", " score more ",
                 "CONCACAF", "CONMEBOL", "UEFA", "FIFA", "AFCON", "Copa",
                 "World Cup", "Olympic", "Tour de France", "Grand Prix", "Formula 1",
+                # Крипто price-prediction рынки (не ETF/регуляторные вопросы)
+                "price of Bitcoin", "price of Ethereum", "price of Solana",
+                "price of XRP", "price of BNB", "price of DOGE",
+                " dip to $", "Bitcoin dip", "Ethereum dip",
+                "be above $", "be below $", "be less than $", "be more than $",
+                "above $1", "above $2", "above $3", "above $4", "above $5",
+                "above $6", "above $7", "above $8", "above $9",
                 " vs ", " vs. ", " FC ", " United ", " Real ", " City ", " Atletico ",
                 "Madrid Open", "Tennis", "ATP", "WTA", "Winner", "Map 1", "Map 2",
                 "Counter-Strike", "CS2", "Dota", "Esports", "UFC", "MMA", "Boxing",
