@@ -134,6 +134,18 @@ class TradingConfig:
     max_entry_slippage: float = 0.05  # рынок убежал от цены кита > чем на 5 центов → пропуск
     resolution_grace_hours: int = 24  # ждём разрешения рынка после close_at, прежде чем закрыть по входу
 
+    # --- Управление капиталом (Фаза 3) ---
+    # Sizing: fractional Kelly от качества кита. f* = (p − c)/(1 − c), где
+    # p — оценка вероятности (winrate лучшего кита сигнала), c — цена входа.
+    # Итог: clamp(банкролл × kelly_fraction × f*, trade_amount_usd, банкролл × position_max_pct)
+    kelly_fraction: float = 0.25      # доля полного Келли (полный — слишком агрессивен)
+    position_max_pct: float = 0.02    # жёсткий кап: максимум 2% банкролла на позицию
+    max_open_positions: int = 10      # лимит одновременных позиций
+    daily_max_loss_pct: float = 0.05  # просадка за день UTC >= 5% → пауза входов до завтра
+    # Флиппинг (из требований): частичная фиксация при движении вероятности
+    partial_take_delta: float = 0.05  # +5 центов → фиксируем часть
+    partial_take_fraction: float = 0.5  # какую долю позиции фиксируем (0 = выключено)
+
 
 @dataclass
 class CacheConfig:
@@ -258,6 +270,9 @@ def load_config() -> BotConfig:
         "TRUSTED_WHALE_MIN_NOTIONAL", config.engine.trusted_whale_min_notional)
     config.trading.max_price = _env_float("MAX_PRICE", config.trading.max_price)
     config.trading.max_entry_slippage = _env_float("MAX_ENTRY_SLIPPAGE", config.trading.max_entry_slippage)
+    config.trading.max_open_positions = _env_int("MAX_OPEN_POSITIONS", config.trading.max_open_positions)
+    config.trading.daily_max_loss_pct = _env_float("DAILY_MAX_LOSS_PCT", config.trading.daily_max_loss_pct)
+    config.trading.position_max_pct = _env_float("POSITION_MAX_PCT", config.trading.position_max_pct)
 
     return config
 

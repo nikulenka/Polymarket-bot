@@ -178,6 +178,65 @@ class TestResolveToken(unittest.TestCase):
         self.assertEqual(resolve_token_id({}, "Yes", "BUY"), (None, None))
 
 
+class TestCapitalManagement(unittest.TestCase):
+    def test_kelly_sizing_caps_at_position_max_pct(self):
+        from src.tracker import position_size_usd
+        # wr=0.8, цена 0.5 → f*=0.6 → 0.25×0.6×1000=$150, но кап 2% = $20
+        size = position_size_usd([{"winrate": 0.8}], price=0.5, balance=1000)
+        self.assertAlmostEqual(size, 1000 * CONFIG.trading.position_max_pct)
+
+    def test_kelly_sizing_scales_with_edge(self):
+        from src.tracker import position_size_usd
+        # wr=0.52, цена 0.5 → f*=0.04 → 0.25×0.04×1000=$10 (между базой и капом)
+        size = position_size_usd([{"winrate": 0.52}], price=0.5, balance=1000)
+        self.assertAlmostEqual(size, 10.0)
+
+    def test_no_edge_returns_base_amount(self):
+        from src.tracker import position_size_usd
+        # winrate <= цены → края нет → базовая ставка
+        size = position_size_usd([{"winrate": 0.5}], price=0.6, balance=1000)
+        self.assertEqual(size, CONFIG.trading.trade_amount_usd)
+        # нет статистики китов → базовая ставка
+        self.assertEqual(position_size_usd([], 0.5, 1000), CONFIG.trading.trade_amount_usd)
+
+    def test_entry_blocked_by_position_limit(self):
+        from src.tracker import entry_blocked
+        positions = {f"t{i}": {"cond_id": f"c{i}"}
+                     for i in range(CONFIG.trading.max_open_positions)}
+        self.assertIsNotNone(entry_blocked(positions, "c_new"))
+
+    def test_entry_blocked_same_market(self):
+        from src.tracker import entry_blocked
+        positions = {"t1": {"cond_id": "c1"}}
+        self.assertIsNotNone(entry_blocked(positions, "c1"))
+        self.assertIsNone(entry_blocked(positions, "c2"))
+
+    def test_daily_stop_loss(self):
+        import tempfile
+        from src import tracker
+        tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        tmp.close()
+        os.unlink(tmp.name)
+        orig = CONFIG.files.metrics_file
+        CONFIG.files.metrics_file = tmp.name
+        try:
+            # Первый вызов дня — якорь, паузы нет
+            self.assertFalse(tracker.daily_stop_active(1000.0))
+            # Просадка 3% < 5% — торгуем
+            self.assertFalse(tracker.daily_stop_active(970.0))
+            # Просадка 6% >= 5% — пауза
+            self.assertTrue(tracker.daily_stop_active(940.0))
+            # Новый день UTC — якорь сбрасывается, торгуем снова
+            m = tracker._load_metrics()
+            m["day"] = "2000-01-01"
+            tracker._save_metrics(m)
+            self.assertFalse(tracker.daily_stop_active(940.0))
+        finally:
+            CONFIG.files.metrics_file = orig
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+
+
 class TestMarketFilter(unittest.TestCase):
     def test_skips_sports(self):
         self.assertTrue(CONFIG.market_filter.should_skip("NBA Finals 2026"))

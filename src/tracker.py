@@ -191,6 +191,7 @@ def manage_positions():
         return
     now = datetime.now(timezone.utc)
     to_delete = []
+    dirty = False  # позиции изменились без удаления (частичная фиксация)
 
     for token_id, p in positions.items():
         try:
@@ -243,6 +244,27 @@ def manage_positions():
                 # TP/SL в пунктах вероятности: на бинарном рынке проценты от цены
                 # не работают (при входе 0.9 даже +25% недостижимы).
                 change = cur - entry
+
+                # Флиппинг (из требований): вероятность сместилась в нашу сторону →
+                # фиксируем часть позиции, остаток едет до TP/SL/разрешения.
+                if (CONFIG.trading.partial_take_fraction > 0
+                        and not p.get("partial_done")
+                        and CONFIG.trading.partial_take_delta <= change < CONFIG.trading.take_profit_delta):
+                    part = round(p["tokens"] * CONFIG.trading.partial_take_fraction, 4)
+                    if part > 0 and close_position(token_id, part, cur):
+                        p["tokens"] = round(p["tokens"] - part, 4)
+                        p["partial_done"] = True
+                        dirty = True
+                        bal = get_usdc_balance()
+                        pnl = part * (cur - entry)
+                        notifier.send(
+                            f"💰 <b>ЧАСТИЧНАЯ ФИКСАЦИЯ</b> [{'PAPER' if CONFIG.trading.paper_mode else 'LIVE'}]\n"
+                            f"{p.get('market', '')[:80]}\n"
+                            f"Продано {part:.1f} шеров @ {cur:.3f} (вход {entry:.3f}), "
+                            f"+{pnl:.2f}$ | остаток {p['tokens']:.1f} шеров\n"
+                            f"💼 Баланс: ${bal:.2f}"
+                        )
+
                 if change >= CONFIG.trading.take_profit_delta:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
@@ -264,24 +286,104 @@ def manage_positions():
         except Exception as e:
             logger.error(f"manage_positions {token_id}: {e}")
 
-    if to_delete:
+    if to_delete or dirty:
         for tid in to_delete:
             positions.pop(tid, None)
         save_positions(positions)
-        notifier.flush()  # TP/SL/timeout — тоже немедленно
+        notifier.flush()  # TP/SL/timeout/частичная фиксация — тоже немедленно
+
+
+# ============================================================
+#  Управление капиталом (Фаза 3)
+# ============================================================
+
+def position_size_usd(whale_stats, price, balance):
+    """
+    Fractional Kelly: f* = (p − c)/(1 − c), p — winrate лучшего кита сигнала
+    (консервативный прокси вероятности), c — цена входа.
+    Без оценённого края — базовая ставка. Кап — position_max_pct банкролла.
+    """
+    base = CONFIG.trading.trade_amount_usd
+    if balance <= 0 or not (0 < price < 1):
+        return base
+    best_wr = max((w.get("winrate") or 0 for w in whale_stats), default=0)
+    p = min(best_wr, 0.95)
+    if p <= price:
+        return base  # по нашей оценке края нет — минимальный размер
+    f_star = (p - price) / (1.0 - price)
+    size = balance * CONFIG.trading.kelly_fraction * f_star
+    cap = balance * CONFIG.trading.position_max_pct
+    return round(max(base, min(size, cap)), 2)
+
+
+def entry_blocked(positions, cond_id):
+    """Лимиты экспозиции. Возвращает строку-причину или None."""
+    if len(positions) >= CONFIG.trading.max_open_positions:
+        return f"⏭ Пропуск (лимит открытых позиций: {CONFIG.trading.max_open_positions})"
+    if any(p.get("cond_id") == cond_id for p in positions.values()):
+        return "⏭ Пропуск (уже есть позиция в этом рынке)"
+    return None
+
+
+def _load_metrics():
+    if os.path.exists(CONFIG.files.metrics_file):
+        try:
+            with open(CONFIG.files.metrics_file) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_metrics(m):
+    with open(CONFIG.files.metrics_file, "w") as f:
+        json.dump(m, f, indent=2)
+
+
+def daily_stop_active(balance):
+    """
+    Дневной стоп-лосс: просадка от баланса на начало дня UTC >= daily_max_loss_pct
+    → новые входы запрещены до следующего дня. Управление открытыми позициями
+    (TP/SL/закрытия) продолжает работать.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    m = _load_metrics()
+    if m.get("day") != today:
+        m.update({"day": today, "day_start_balance": balance, "paused": False})
+        _save_metrics(m)
+        return False
+    start = m.get("day_start_balance") or balance
+    if start <= 0:
+        return False
+    drawdown = (start - balance) / start
+    if drawdown >= CONFIG.trading.daily_max_loss_pct:
+        if not m.get("paused"):
+            m["paused"] = True
+            _save_metrics(m)
+            notifier.send(
+                f"⛔ <b>Дневной стоп-лосс</b>: просадка −{drawdown*100:.1f}% "
+                f"(${start:.2f} → ${balance:.2f}). Новые входы на паузе до завтра (UTC)."
+            )
+            notifier.flush()
+        return True
+    return False
 
 
 # ============================================================
 #  Исполнение сделки по сигналу (paper/live)
 # ============================================================
 
-def execute_trade(signal, positions):
+def execute_trade(signal, positions, whale_stats=None):
     """Пробует открыть позицию по сигналу. Возвращает строку-статус."""
     cond_id = signal["cond_id"]
     whale_price = signal["median_price"]
 
     if not (0.01 <= whale_price < 1):
         return "⏭ Пропуск (цена кита вне диапазона)"
+
+    blocked = entry_blocked(positions, cond_id)
+    if blocked:
+        return blocked
 
     tokens_map = api.get_market_tokens(cond_id)
     if tokens_map == "CLOSED":
@@ -309,12 +411,15 @@ def execute_trade(signal, positions):
     balance = get_usdc_balance()
     if balance < 1.0:
         return f"⏭ Пропуск (баланс ${balance:.2f} < $1.00)"
+    if daily_stop_active(balance):
+        return "⛔ Дневной стоп-лосс — входы на паузе до завтра (UTC)"
+
+    entry_usd = position_size_usd(whale_stats or [], price, balance)
 
     mode = "PAPER" if CONFIG.trading.paper_mode else "LIVE"
-    if not place_bet(token_id, "BUY", CONFIG.trading.trade_amount_usd, price):
+    if not place_bet(token_id, "BUY", entry_usd, price):
         return "❌ Ошибка ордера"
 
-    entry_usd = CONFIG.trading.trade_amount_usd
     tokens = max(entry_usd / price, CONFIG.trading.min_tokens) if price > 0 else CONFIG.trading.min_tokens
     positions[token_id] = {
         "market": signal["market"],
@@ -328,7 +433,7 @@ def execute_trade(signal, positions):
         "close_at": (datetime.now(timezone.utc) + timedelta(hours=CONFIG.trading.position_hold_hours)).isoformat(),
     }
     save_positions(positions)
-    return f"✅ {mode}: BUY {tokens:.1f} шеров «{bought_outcome}» @ {price:.3f}"
+    return f"✅ {mode}: BUY {tokens:.1f} шеров «{bought_outcome}» @ {price:.3f} (${tokens * price:.2f})"
 
 
 # ============================================================
@@ -515,7 +620,7 @@ def run():
                         })
                         db.touch_last_active(e["wallet"])
 
-                trade_status = execute_trade(signal, positions)
+                trade_status = execute_trade(signal, positions, whale_stats)
                 total_signals += 1
                 msg = notifier.format_signal(total_signals, signal, whale_stats, trade_status)
                 notifier.send(msg)
