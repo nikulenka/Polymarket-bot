@@ -1,5 +1,7 @@
 httpx
 pandas
 python-dotenv
-anthropic
-py-clob-client
+
+# CLOB V2 SDK. Установлен локально как py_clob_client_v2 (v1.0.0).
+# Нужен только для LIVE-режима; в PAPER-режиме не используется.
+# py-clob-client-v2
