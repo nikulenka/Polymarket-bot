@@ -8,6 +8,15 @@ import tempfile
 import unittest
 
 from src.config import CONFIG
+
+# ВАЖНО: отключаем Telegram ДО импорта модулей, создающих Notifier
+# (src.tracker создаёт его на уровне модуля). Иначе тесты, проходящие
+# через notifier.send() (дневной стоп-лосс и т.п.), шлют РЕАЛЬНЫЕ
+# сообщения в чат с токеном из локального .env.
+CONFIG.telegram.enabled = False
+CONFIG.telegram.token = None
+CONFIG.telegram.chat_id = None
+
 from src import api, db, scout, engine, notifier
 
 
