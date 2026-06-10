@@ -211,6 +211,19 @@ class TestCapitalManagement(unittest.TestCase):
         self.assertIsNotNone(entry_blocked(positions, "c1"))
         self.assertIsNone(entry_blocked(positions, "c2"))
 
+    def test_poll_round_robin(self):
+        from src.tracker import next_poll_chunk
+        tracked = {"w1", "w2", "w3"}
+        chunk, rest = next_poll_chunk([], tracked, 2)
+        self.assertEqual(chunk, ["w1", "w2"])
+        self.assertEqual(rest, ["w3"])
+        chunk, rest = next_poll_chunk(rest, tracked, 2)
+        self.assertEqual(chunk, ["w3"])
+        self.assertEqual(rest, [])
+        # пустая очередь снова пополняется из tracked
+        chunk, _ = next_poll_chunk(rest, tracked, 2)
+        self.assertEqual(chunk, ["w1", "w2"])
+
     def test_daily_stop_loss(self):
         import tempfile
         from src import tracker

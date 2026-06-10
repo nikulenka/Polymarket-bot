@@ -58,6 +58,13 @@ class MonitorConfig:
     min_wallets: int = 2             # минимум китов для консенсуса
     min_size_usdc: float = 50.0      # порог notional для известного кита
     heartbeat_interval: int = 600    # пульс в лог (10 мин)
+    # Персональный опрос китов (/trades?user=) вместо глобальной ленты:
+    # в глобальной ленте сделка видна от имени ТЕЙКЕРА, лимитные ордера
+    # китов туда не попадают — бот слеп к большинству их сделок.
+    whales_per_cycle: int = 25       # сколько китов опрашиваем за цикл (round-robin)
+    per_whale_limit: int = 50        # сделок на кита за обычный опрос
+    first_cycle_limit: int = 200     # на первом проходе — глубже (backfill окна)
+    daily_report_hour_utc: int = 8   # ежедневный heartbeat-отчёт в Telegram (час UTC)
 
 
 @dataclass

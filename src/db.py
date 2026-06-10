@@ -337,6 +337,18 @@ def whale_signal_stats() -> Dict[str, Dict[str, int]]:
     return stats
 
 
+def signal_outcome_summary() -> Dict[str, int]:
+    """Сводка по сигналам для ежедневного отчёта."""
+    with _conn() as con:
+        total = con.execute(
+            "SELECT COUNT(*) c FROM signal_outcomes").fetchone()["c"]
+        resolved = con.execute(
+            "SELECT COUNT(*) c FROM signal_outcomes WHERE resolved_at IS NOT NULL").fetchone()["c"]
+        wins = con.execute(
+            "SELECT COUNT(*) c FROM signal_outcomes WHERE won = 1").fetchone()["c"]
+    return {"total": total, "resolved": resolved, "wins": wins}
+
+
 def prune_bad_performers(min_signals: int, min_winshare: float) -> List[str]:
     """
     Удаляет китов, чьи скопированные сигналы статистически убыточны:

@@ -147,3 +147,8 @@ run.sh          запуск трекера в фоне
 update_daily.sh ежедневный рескан китов + рестарт
 .env.example    шаблон переменных окружения
 ```
+## Шпаргалка по управлению:
+- ssh root@92.62.132.69 | #вход теперь по ключу, без пароля
+- journalctl -u polymarket-tracker -f | #живые логи
+- sudo systemctl restart polymarket-tracker | #перезапуск
+- cd /root/polymarket-bot && git pull && sudo systemctl restart polymarket-tracker | #обновление

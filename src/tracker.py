@@ -448,6 +448,52 @@ def _load_elite():
     )
 
 
+def next_poll_chunk(queue, tracked, n):
+    """
+    Round-robin опроса китов: возвращает (chunk, остаток очереди).
+    Пустая очередь пополняется из актуального списка отслеживаемых.
+    """
+    if not queue:
+        queue = sorted(tracked)
+    return queue[:n], queue[n:]
+
+
+def maybe_daily_report():
+    """
+    Ежедневный heartbeat в Telegram (после daily_report_hour_utc):
+    подтверждает, что бот жив, даже если сигналов не было.
+    """
+    now = datetime.now(timezone.utc)
+    if now.hour < CONFIG.monitor.daily_report_hour_utc:
+        return
+    m = _load_metrics()
+    today = now.strftime("%Y-%m-%d")
+    if m.get("last_report_day") == today:
+        return
+    m["last_report_day"] = today
+    _save_metrics(m)
+
+    tracked = db.get_tracked_addresses()
+    elite = _load_elite()
+    positions = load_positions()
+    balance = get_usdc_balance()
+    start = CONFIG.trading.paper_start_balance
+    s = db.signal_outcome_summary()
+    winshare = f"{s['wins']}/{s['resolved']}" if s["resolved"] else "—"
+    total_pnl = balance - start
+    sign = "+" if total_pnl >= 0 else ""
+    mode = "PAPER" if CONFIG.trading.paper_mode else "LIVE"
+
+    notifier.send(
+        f"💓 <b>Бот жив</b> [{mode}]\n"
+        f"Киты: {len(tracked)} (элитных {len(elite)})\n"
+        f"Сигналов всего: {s['total']} | разрешено: {s['resolved']} | правота китов: {winshare}\n"
+        f"Открытых позиций: {len(positions)}\n"
+        f"💼 Баланс: ${balance:.2f} ({sign}{total_pnl:.2f}$ от старта)"
+    )
+    notifier.flush()
+
+
 def check_signal_outcomes():
     """
     Сверяет записанные сигналы с разрешением рынков (был ли кит прав)
@@ -507,6 +553,8 @@ def run():
     positions = load_positions()
     last_whale_reload = time.time()
     last_outcome_check = 0.0
+    poll_queue = []
+    first_pass_left = set(tracked)  # кого ещё ни разу не опросили (backfill глубже)
 
     while True:
         try:
@@ -526,13 +574,25 @@ def run():
                     tracked = db.get_tracked_addresses()
                     elite = _load_elite()
 
+            maybe_daily_report()
+
             now_ts = datetime.now(timezone.utc).timestamp()
             cutoff = now_ts - CONFIG.monitor.signal_window
-            limit = 5000 if not seen else 500
 
-            trades = api.get_trades(limit=limit)
+            # Персональный опрос китов (round-robin). Глобальная лента /trades
+            # не годится: сделка в ней видна от имени ТЕЙКЕРА, и лимитные
+            # ордера китов (мейкер-сторона) туда не попадают.
+            chunk, poll_queue = next_poll_chunk(
+                poll_queue, tracked, CONFIG.monitor.whales_per_cycle)
+            trades = []
+            for addr in chunk:
+                limit = (CONFIG.monitor.first_cycle_limit
+                         if addr in first_pass_left
+                         else CONFIG.monitor.per_whale_limit)
+                first_pass_left.discard(addr)
+                trades.extend(api.get_trades(limit=limit, user=addr))
             if not trades:
-                time.sleep(10)
+                time.sleep(CONFIG.monitor.poll_interval)
                 continue
 
             new_count = 0
