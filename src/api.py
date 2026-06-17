@@ -14,6 +14,7 @@
 import time
 import json
 import logging
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Callable
 
 import httpx
@@ -173,14 +174,22 @@ def get_liquid_markets(limit: int = 40, min_liquidity: float = 500_000.0) -> Lis
 
 
 def get_market_resolution(condition_id: str) -> Optional[str]:
-    """Возвращает выигравший outcome (lower) если рынок закрыт и разрешён, иначе None."""
-    data = _get(f"{CONFIG.api.gamma_api}/markets", {"conditionId": condition_id},
+    """Возвращает выигравший outcome (lower) если рынок фактически разрешён, иначе None.
+
+    ВАЖНО: фильтр Gamma — это `condition_ids` (мн.ч.). `conditionId` игнорируется
+    и отдаёт случайный список рынков.
+
+    Polymarket держит closed=False ещё долго после фактического исхода (задержка
+    UMA, статус disputed), поэтому опираться только на флаг closed нельзя — петля
+    обратной связи зависала бы на сутки-двое. Рынок считаем разрешённым, если он
+    официально closed ЛИБО его endDate уже прошёл И цена одного исхода вышла на
+    экстремум (>= 0.99).
+    """
+    data = _get(f"{CONFIG.api.gamma_api}/markets", {"condition_ids": condition_id},
                 timeout=CONFIG.timeout.default_timeout)
     if not isinstance(data, list) or not data:
         return None
     m = data[0]
-    if not m.get("closed"):
-        return None
     try:
         outcomes = json.loads(m.get("outcomes", "[]"))
         prices = json.loads(m.get("outcomePrices", "[]"))
@@ -196,7 +205,21 @@ def get_market_resolution(condition_id: str) -> Optional[str]:
             continue
         if pf > max_price:
             max_price, winner = pf, o
-    return winner.strip().lower() if winner and max_price >= 0.99 else None
+    if not winner or max_price < 0.99:
+        return None
+    # Официально закрыт — доверяем безусловно.
+    if m.get("closed"):
+        return winner.strip().lower()
+    # Ещё не closed, но событие прошло и цена на экстремуме → фактически решён.
+    end = m.get("endDate")
+    if end:
+        try:
+            end_dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) >= end_dt:
+                return winner.strip().lower()
+        except (ValueError, TypeError):
+            pass
+    return None
 
 
 # ============================================================

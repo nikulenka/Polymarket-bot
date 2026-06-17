@@ -187,6 +187,51 @@ class TestResolveToken(unittest.TestCase):
         self.assertEqual(resolve_token_id({}, "Yes", "BUY"), (None, None))
 
 
+class TestMarketResolution(unittest.TestCase):
+    """get_market_resolution: фильтр condition_ids + признак фактического исхода."""
+    from unittest.mock import patch
+
+    def _market(self, **over):
+        m = {"closed": False, "outcomes": '["Yes", "No"]',
+             "outcomePrices": '["0.5", "0.5"]', "endDate": "2030-01-01T00:00:00Z"}
+        m.update(over)
+        return [m]
+
+    def test_closed_market_resolves(self):
+        from unittest.mock import patch
+        with patch.object(api, "_get", return_value=self._market(
+                closed=True, outcomePrices='["0.995", "0.005"]')):
+            self.assertEqual(api.get_market_resolution("0xabc"), "yes")
+
+    def test_past_enddate_extreme_resolves_even_if_not_closed(self):
+        # Polymarket держит closed=False после исхода — событие прошло, цена на экстремуме
+        from unittest.mock import patch
+        with patch.object(api, "_get", return_value=self._market(
+                closed=False, endDate="2020-01-01T00:00:00Z",
+                outcomePrices='["0.002", "0.998"]')):
+            self.assertEqual(api.get_market_resolution("0xabc"), "no")
+
+    def test_future_enddate_extreme_stays_pending(self):
+        # Цена на экстремуме, но событие ещё не наступило → не считаем разрешённым
+        from unittest.mock import patch
+        with patch.object(api, "_get", return_value=self._market(
+                closed=False, endDate="2030-01-01T00:00:00Z",
+                outcomePrices='["0.001", "0.999"]')):
+            self.assertIsNone(api.get_market_resolution("0xabc"))
+
+    def test_non_extreme_price_stays_pending(self):
+        from unittest.mock import patch
+        with patch.object(api, "_get", return_value=self._market(
+                closed=False, endDate="2020-01-01T00:00:00Z",
+                outcomePrices='["0.6", "0.4"]')):
+            self.assertIsNone(api.get_market_resolution("0xabc"))
+
+    def test_empty_response_returns_none(self):
+        from unittest.mock import patch
+        with patch.object(api, "_get", return_value=[]):
+            self.assertIsNone(api.get_market_resolution("0xabc"))
+
+
 class TestCapitalManagement(unittest.TestCase):
     def test_kelly_sizing_caps_at_position_max_pct(self):
         from src.tracker import position_size_usd
