@@ -600,7 +600,6 @@ def run():
 
     seen = OrderedDict()
     buffer = []
-    total_signals = 0
     positions = load_positions()
     last_whale_reload = time.time()
     last_outcome_check = 0.0
@@ -716,8 +715,9 @@ def run():
 
                 # Петля обратной связи: фиксируем сигнал для сверки с исходом рынка.
                 # Пишем независимо от того, откроем ли позицию — оцениваем КИТА.
-                db.record_signal_outcome(signal, sorted(side_wallets),
-                                         entry_price=signal["median_price"])
+                # id из БД — персистентный номер сигнала, не сбрасывается при рестарте.
+                signal_id = db.record_signal_outcome(signal, sorted(side_wallets),
+                                                     entry_price=signal["median_price"])
 
                 # tx_history (антидубль + история по схеме из требований)
                 for e in entries:
@@ -732,8 +732,7 @@ def run():
                         db.touch_last_active(e["wallet"])
 
                 trade_status = execute_trade(signal, positions, whale_stats)
-                total_signals += 1
-                msg = notifier.format_signal(total_signals, signal, whale_stats, trade_status)
+                msg = notifier.format_signal(signal_id, signal, whale_stats, trade_status)
                 notifier.send(msg)
                 notifier.flush()  # сигнал → немедленная доставка, не ждём батч-таймер
                 logger.info(" | ".join(msg.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","").split("\n")))

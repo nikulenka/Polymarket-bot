@@ -275,10 +275,15 @@ def tx_seen(tx_hash: str, outcome: str) -> bool:
 # ============================================================
 
 def record_signal_outcome(signal: Dict[str, Any], wallets: List[str],
-                          entry_price: float) -> None:
-    """Фиксирует сигнал для последующей сверки с разрешением рынка."""
+                          entry_price: float) -> int:
+    """
+    Фиксирует сигнал для последующей сверки с разрешением рынка.
+    Возвращает id записи (autoincrement, персистентный) — используется как
+    номер сигнала в алерте, чтобы он не сбрасывался при рестарте процесса
+    (в отличие от счётчика в памяти).
+    """
     with _conn() as con:
-        con.execute(
+        cur = con.execute(
             """
             INSERT INTO signal_outcomes
                 (cond_id, market_title, side, outcome, entry_price,
@@ -296,6 +301,7 @@ def record_signal_outcome(signal: Dict[str, Any], wallets: List[str],
                 _now(),
             ),
         )
+        return cur.lastrowid
 
 
 def get_unresolved_outcomes(limit: int = 100) -> List[Dict[str, Any]]:
