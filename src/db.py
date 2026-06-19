@@ -349,6 +349,46 @@ def signal_outcome_summary() -> Dict[str, int]:
     return {"total": total, "resolved": resolved, "wins": wins}
 
 
+def _entry_bucket(price) -> str:
+    if price is None:
+        return "?"
+    if price < 0.3:
+        return "<0.3"
+    if price < 0.5:
+        return "0.3-0.5"
+    if price < 0.7:
+        return "0.5-0.7"
+    if price < 0.9:
+        return "0.7-0.9"
+    return ">=0.9"
+
+
+def signal_outcome_breakdown() -> Dict[str, Dict[str, Dict[str, int]]]:
+    """
+    Патч E: разбивка правоты по стороне (BUY/SELL), типу сигнала и корзине цены
+    входа — чтобы калибровка видела, где край теряется (SELL, зона фаворитов).
+    Возвращает {"by_side": {...}, "by_type": {...}, "by_bucket": {...}},
+    где значение = {"resolved": n, "wins": k}.
+    """
+    out = {"by_side": {}, "by_type": {}, "by_bucket": {}}
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT side, signal_type, entry_price, won FROM signal_outcomes "
+            "WHERE resolved_at IS NOT NULL"
+        ).fetchall()
+    for r in rows:
+        won = int(r["won"] or 0)
+        for dim, key in (
+            ("by_side", (r["side"] or "?").upper()),
+            ("by_type", r["signal_type"] or "?"),
+            ("by_bucket", _entry_bucket(r["entry_price"])),
+        ):
+            s = out[dim].setdefault(key, {"resolved": 0, "wins": 0})
+            s["resolved"] += 1
+            s["wins"] += won
+    return out
+
+
 def prune_bad_performers(min_signals: int, min_winshare: float) -> List[str]:
     """
     Удаляет китов, чьи скопированные сигналы статистически убыточны:

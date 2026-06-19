@@ -63,6 +63,22 @@ def build_report() -> str:
             who = (db.get_whale(addr) or {}).get("pseudonym") or addr[:10]
             lines.append(f"  • {who}: {w}/{r} ({share:.0%})")
 
+    # Патч E: где теряется край — разбивка правоты по стороне / типу / цене входа.
+    if resolved:
+        bd = db.signal_outcome_breakdown()
+
+        def fmt(d):
+            parts = []
+            for k, s in sorted(d.items(), key=lambda kv: -kv[1]["resolved"]):
+                if s["resolved"]:
+                    parts.append(f"{k} {s['wins']}/{s['resolved']} ({s['wins'] / s['resolved'] * 100:.0f}%)")
+            return ", ".join(parts) if parts else "—"
+
+        lines.append("\n<b>Где теряется край:</b>")
+        lines.append(f"  по стороне: {fmt(bd['by_side'])}")
+        lines.append(f"  по типу:    {fmt(bd['by_type'])}")
+        lines.append(f"  по цене:    {fmt(bd['by_bucket'])}")
+
     # Готовность к калибровке
     lines.append("")
     if resolved >= 30:

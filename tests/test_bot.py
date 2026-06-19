@@ -253,6 +253,15 @@ class TestCapitalManagement(unittest.TestCase):
         # нет статистики китов → базовая ставка
         self.assertEqual(position_size_usd([], 0.5, 1000), CONFIG.trading.trade_amount_usd)
 
+    def test_cheap_entry_uses_higher_cap(self):
+        # Патч B: вход < cheap_entry_max → кап position_max_pct_cheap (выше базового)
+        from src.tracker import position_size_usd
+        # wr=0.9, цена 0.2 (< 0.35) → f* большой, упираемся в повышенный кап 4%
+        size = position_size_usd([{"winrate": 0.9}], price=0.2, balance=1000)
+        self.assertAlmostEqual(size, 1000 * CONFIG.trading.position_max_pct_cheap)
+        self.assertGreater(CONFIG.trading.position_max_pct_cheap,
+                           CONFIG.trading.position_max_pct)
+
     def test_entry_blocked_by_position_limit(self):
         from src.tracker import entry_blocked
         positions = {f"t{i}": {"cond_id": f"c{i}"}
@@ -302,6 +311,90 @@ class TestCapitalManagement(unittest.TestCase):
             CONFIG.files.metrics_file = orig
             if os.path.exists(tmp.name):
                 os.unlink(tmp.name)
+
+
+class TestExitProfile(unittest.TestCase):
+    """Патч A: профиль выхода зависит от цены входа."""
+
+    def test_cheap_entry_disables_partial_and_widens_tp(self):
+        from src.tracker import exit_params
+        _, frac, tp = exit_params(0.20)  # дешёвый лонгшот
+        self.assertEqual(frac, CONFIG.trading.cheap_partial_take_fraction)  # 0 → флип выкл
+        self.assertEqual(tp, CONFIG.trading.cheap_take_profit_delta)        # широкий TP
+
+    def test_expensive_entry_takes_fast(self):
+        from src.tracker import exit_params
+        pdelta, frac, tp = exit_params(0.70)  # фаворит
+        self.assertEqual(tp, CONFIG.trading.expensive_take_profit_delta)
+        self.assertEqual(pdelta, CONFIG.trading.expensive_partial_take_delta)
+        self.assertGreater(frac, 0)
+
+    def test_mid_entry_uses_base_profile(self):
+        from src.tracker import exit_params
+        pdelta, frac, tp = exit_params(0.42)  # середина
+        self.assertEqual(tp, CONFIG.trading.take_profit_delta)
+        self.assertEqual(frac, CONFIG.trading.partial_take_fraction)
+        self.assertEqual(pdelta, CONFIG.trading.partial_take_delta)
+
+
+class TestSignalGates(unittest.TestCase):
+    """Патчи B/C: ограничения одиночного сигнала trusted_whale в execute_trade."""
+    from unittest.mock import patch
+
+    def _signal(self, **over):
+        s = {"cond_id": "c1", "median_price": 0.6, "side": "BUY",
+             "consensus_outcome": "yes", "signal_type": "trusted_whale",
+             "market": "Will X?"}
+        s.update(over)
+        return s
+
+    def test_single_whale_sell_skipped(self):
+        from unittest.mock import patch
+        from src import tracker
+        with patch.object(tracker.api, "get_market_tokens",
+                          return_value={"yes": "tok_y", "no": "tok_n"}), \
+             patch.object(tracker.api, "get_price", return_value=0.4):
+            status = tracker.execute_trade(self._signal(side="SELL"), {}, [])
+        self.assertIn("SELL", status)
+        self.assertTrue(status.startswith("⏭"))
+
+    def test_single_whale_favorite_price_skipped(self):
+        from unittest.mock import patch
+        from src import tracker
+        with patch.object(tracker.api, "get_market_tokens",
+                          return_value={"yes": "tok_y", "no": "tok_n"}), \
+             patch.object(tracker.api, "get_price", return_value=0.65):
+            status = tracker.execute_trade(self._signal(side="BUY"), {}, [])
+        self.assertTrue(status.startswith("⏭"))
+        self.assertIn("консенсус", status)
+
+    def test_single_whale_no_edge_skipped(self):
+        from unittest.mock import patch
+        from src import tracker
+        # цена 0.45 < single_whale_max_price, но WinRate кита 0.40 <= цена → нет края
+        with patch.object(tracker.api, "get_market_tokens",
+                          return_value={"yes": "tok_y", "no": "tok_n"}), \
+             patch.object(tracker.api, "get_price", return_value=0.45):
+            status = tracker.execute_trade(
+                self._signal(side="BUY"), {}, [{"winrate": 0.40}])
+        self.assertTrue(status.startswith("⏭"))
+        self.assertIn("края", status)
+
+    def test_consensus_bypasses_single_whale_gates(self):
+        # Консенсус-сигнал в зоне фаворитов на SELL НЕ режется гейтами одиночки
+        from unittest.mock import patch
+        from src import tracker
+        with patch.object(tracker.api, "get_market_tokens",
+                          return_value={"yes": "tok_y", "no": "tok_n"}), \
+             patch.object(tracker.api, "get_price", return_value=0.65), \
+             patch.object(tracker, "get_usdc_balance", return_value=1000.0), \
+             patch.object(tracker, "daily_stop_active", return_value=False), \
+             patch.object(tracker, "place_bet", return_value=True):
+            # median_price=0.35 → при SELL ref=1-0.35=0.65 ≈ ask 0.65, слиппедж ок
+            status = tracker.execute_trade(
+                self._signal(side="SELL", signal_type="consensus", median_price=0.35),
+                {}, [])
+        self.assertFalse(status.startswith("⏭"), status)
 
 
 class TestMarketFilter(unittest.TestCase):

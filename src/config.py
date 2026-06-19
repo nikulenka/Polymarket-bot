@@ -153,6 +153,32 @@ class TradingConfig:
     partial_take_delta: float = 0.05  # +5 центов → фиксируем часть
     partial_take_fraction: float = 0.5  # какую долю позиции фиксируем (0 = выключено)
 
+    # --- Патч A: профиль выхода зависит от цены входа ---
+    # Анализ 76 закрытых сделок: 77% валовой прибыли пришло с 19 мунбэгов
+    # (доходность >30%), а флип резал их пополам уже на +5 центов. Поэтому:
+    # дешёвый лонгшот (вход < cheap_entry_max) — НЕ фиксируем частично,
+    # даём ехать до широкого TP/разрешения (там и зашит правый хвост).
+    cheap_entry_max: float = 0.35
+    cheap_take_profit_delta: float = 0.45      # дешёвый вход: TP далеко (почти до 1.0)
+    cheap_partial_take_fraction: float = 0.0   # дешёвый вход: без частичной фиксации
+    # Дорогой вход (фаворит, >= expensive_entry_min) — апсайд мал, забираем быстро.
+    expensive_entry_min: float = 0.50
+    expensive_take_profit_delta: float = 0.06
+    expensive_partial_take_delta: float = 0.03
+
+    # --- Патч B: повышенный кап для дешёвых входов (асимметричный край) ---
+    # Корзина <0.5 дала +$147, корзина 0.5–0.7 дала −$16: концентрируем капитал
+    # там, где работает асимметрия.
+    position_max_pct_cheap: float = 0.04
+
+    # --- Патчи B/C: ограничения ОДИНОЧНОГО сигнала trusted_whale ---
+    # Консенсус (2+ кошелька) всегда проходит — его край в группе, а не в
+    # winrate одного кита. Одиночному киту в зоне фаворитов / на SELL / без
+    # оценённого края не доверяем (исторически убыточно).
+    single_whale_max_price: float = 0.50   # одиночный кит выше этой цены → скип
+    single_whale_allow_sell: bool = False  # одиночный кит на SELL → скип (SELL: 25% правоты)
+    skip_when_no_edge: bool = True         # WinRate кита <= цена → нет края → скип одиночного
+
 
 @dataclass
 class CacheConfig:
@@ -280,6 +306,20 @@ def load_config() -> BotConfig:
     config.trading.max_open_positions = _env_int("MAX_OPEN_POSITIONS", config.trading.max_open_positions)
     config.trading.daily_max_loss_pct = _env_float("DAILY_MAX_LOSS_PCT", config.trading.daily_max_loss_pct)
     config.trading.position_max_pct = _env_float("POSITION_MAX_PCT", config.trading.position_max_pct)
+
+    # Патч D: масштабирование капитала и профиля выхода через .env — без правки
+    # кода и БЕЗ переключения PAPER_MODE. Позволяет наращивать банк/агрессию,
+    # когда петля обратной связи подтвердит край на разрешённых рынках.
+    config.trading.paper_start_balance = _env_float("PAPER_START_BALANCE", config.trading.paper_start_balance)
+    config.trading.kelly_fraction = _env_float("KELLY_FRACTION", config.trading.kelly_fraction)
+    config.trading.position_max_pct_cheap = _env_float("POSITION_MAX_PCT_CHEAP", config.trading.position_max_pct_cheap)
+    config.trading.take_profit_delta = _env_float("TAKE_PROFIT_DELTA", config.trading.take_profit_delta)
+    config.trading.stop_loss_delta = _env_float("STOP_LOSS_DELTA", config.trading.stop_loss_delta)
+    config.trading.cheap_entry_max = _env_float("CHEAP_ENTRY_MAX", config.trading.cheap_entry_max)
+    config.trading.cheap_take_profit_delta = _env_float("CHEAP_TAKE_PROFIT_DELTA", config.trading.cheap_take_profit_delta)
+    config.trading.single_whale_max_price = _env_float("SINGLE_WHALE_MAX_PRICE", config.trading.single_whale_max_price)
+    config.trading.single_whale_allow_sell = _env_bool("SINGLE_WHALE_ALLOW_SELL", config.trading.single_whale_allow_sell)
+    config.trading.skip_when_no_edge = _env_bool("SKIP_WHEN_NO_EDGE", config.trading.skip_when_no_edge)
 
     return config
 

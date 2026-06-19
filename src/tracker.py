@@ -184,6 +184,24 @@ def _settle_resolved(token_id: str, p: dict, exit_price: float) -> bool:
     return True
 
 
+def exit_params(entry: float):
+    """
+    Патч A: профиль выхода зависит от цены входа.
+    Возвращает (partial_take_delta, partial_take_fraction, take_profit_delta).
+
+    • Дешёвый лонгшот (вход < cheap_entry_max): не фиксируем частично, едем до
+      широкого TP/разрешения — именно тут живёт правый хвост (мунбэги).
+    • Дорогой фаворит (вход >= expensive_entry_min): апсайд мал, забираем быстро.
+    • Середина: базовый профиль (флип на +5c, TP +10c).
+    """
+    t = CONFIG.trading
+    if entry < t.cheap_entry_max:
+        return t.partial_take_delta, t.cheap_partial_take_fraction, t.cheap_take_profit_delta
+    if entry >= t.expensive_entry_min:
+        return t.expensive_partial_take_delta, t.partial_take_fraction, t.expensive_take_profit_delta
+    return t.partial_take_delta, t.partial_take_fraction, t.take_profit_delta
+
+
 def manage_positions():
     """TP / SL / выход по времени / закрытие по исходу разрешённого рынка."""
     positions = load_positions()
@@ -245,12 +263,16 @@ def manage_positions():
                 # не работают (при входе 0.9 даже +25% недостижимы).
                 change = cur - entry
 
+                # Патч A: профиль выхода зависит от цены входа (флип/TP).
+                ptake_delta, ptake_frac, tp_delta = exit_params(entry)
+
                 # Флиппинг (из требований): вероятность сместилась в нашу сторону →
                 # фиксируем часть позиции, остаток едет до TP/SL/разрешения.
-                if (CONFIG.trading.partial_take_fraction > 0
+                # Для дешёвых лонгшотов ptake_frac=0 → флип выключен, хвост едет дальше.
+                if (ptake_frac > 0
                         and not p.get("partial_done")
-                        and CONFIG.trading.partial_take_delta <= change < CONFIG.trading.take_profit_delta):
-                    part = round(p["tokens"] * CONFIG.trading.partial_take_fraction, 4)
+                        and ptake_delta <= change < tp_delta):
+                    part = round(p["tokens"] * ptake_frac, 4)
                     if part > 0 and close_position(token_id, part, cur):
                         p["tokens"] = round(p["tokens"] - part, 4)
                         p["partial_done"] = True
@@ -265,7 +287,7 @@ def manage_positions():
                             f"💼 Баланс: ${bal:.2f}"
                         )
 
-                if change >= CONFIG.trading.take_profit_delta:
+                if change >= tp_delta:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
                         bal = get_usdc_balance()
@@ -312,7 +334,11 @@ def position_size_usd(whale_stats, price, balance):
         return base  # по нашей оценке края нет — минимальный размер
     f_star = (p - price) / (1.0 - price)
     size = balance * CONFIG.trading.kelly_fraction * f_star
-    cap = balance * CONFIG.trading.position_max_pct
+    # Патч B: дешёвый вход — асимметричный край, повышенный кап.
+    max_pct = (CONFIG.trading.position_max_pct_cheap
+               if price < CONFIG.trading.cheap_entry_max
+               else CONFIG.trading.position_max_pct)
+    cap = balance * max_pct
     return round(max(base, min(size, cap)), 2)
 
 
@@ -402,6 +428,21 @@ def execute_trade(signal, positions, whale_stats=None):
     if price > CONFIG.trading.max_price:
         return f"⏭ Пропуск (цена {price:.3f} > {CONFIG.trading.max_price})"
 
+    # Патчи B/C: ограничения для ОДИНОЧНОГО сигнала (trusted_whale).
+    # Консенсус (2+ кошелька) не трогаем — его край в группе, а не в winrate
+    # одного кита. По анализу: зона фаворитов 0.5–0.7 убыточна, SELL даёт 25%
+    # правоты, а одиночка без оценённого края = микроставки на $0 прибыли.
+    if signal.get("signal_type") == "trusted_whale":
+        if signal["side"] == "SELL" and not CONFIG.trading.single_whale_allow_sell:
+            return "⏭ Пропуск (одиночный кит на SELL — нужен консенсус)"
+        if price >= CONFIG.trading.single_whale_max_price:
+            return (f"⏭ Пропуск (одиночный кит, цена {price:.2f} ≥ "
+                    f"{CONFIG.trading.single_whale_max_price} — фавориты только консенсусом)")
+        if CONFIG.trading.skip_when_no_edge:
+            best_wr = max((w.get("winrate") or 0 for w in (whale_stats or [])), default=0)
+            if best_wr <= price:
+                return f"⏭ Пропуск (нет края: WinRate кита {best_wr:.0%} ≤ цена {price:.2f})"
+
     # Цена кита указана для исхода из сигнала; при SELL мы покупаем
     # противоположный токен, его справедливая цена ≈ 1 − цена кита.
     ref_price = whale_price if signal["side"] == "BUY" else 1.0 - whale_price
@@ -484,10 +525,20 @@ def maybe_daily_report():
     sign = "+" if total_pnl >= 0 else ""
     mode = "PAPER" if CONFIG.trading.paper_mode else "LIVE"
 
+    # Патч E: правота по стороне (BUY/SELL) — видно, не тащит ли SELL вниз.
+    side_line = ""
+    if s["resolved"]:
+        by_side = db.signal_outcome_breakdown()["by_side"]
+        parts = [f"{k} {v['wins']}/{v['resolved']}" for k, v in sorted(by_side.items())
+                 if v["resolved"]]
+        if parts:
+            side_line = f"\nПо стороне: {' | '.join(parts)}"
+
     notifier.send(
         f"💓 <b>Бот жив</b> [{mode}]\n"
         f"Киты: {len(tracked)} (элитных {len(elite)})\n"
-        f"Сигналов всего: {s['total']} | разрешено: {s['resolved']} | правота китов: {winshare}\n"
+        f"Сигналов всего: {s['total']} | разрешено: {s['resolved']} | правота китов: {winshare}"
+        f"{side_line}\n"
         f"Открытых позиций: {len(positions)}\n"
         f"💼 Баланс: ${balance:.2f} ({sign}{total_pnl:.2f}$ от старта)"
     )
