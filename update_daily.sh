@@ -1,6 +1,6 @@
 #!/bin/bash
 # Ежедневное обновление: пересканировать китов (Whale Scouter) и перезапустить трекер.
-source "/Users/vitalyn/00 Antigravity/.venv/bin/activate"
+source "/Users/vitalyn/MyDocuments/00 My Projects/.venv/bin/activate"
 cd "$(dirname "$0")" || exit
 export PYTHONPATH=.
 

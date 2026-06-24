@@ -186,20 +186,26 @@ def _settle_resolved(token_id: str, p: dict, exit_price: float) -> bool:
 
 def exit_params(entry: float):
     """
-    Патч A: профиль выхода зависит от цены входа.
-    Возвращает (partial_take_delta, partial_take_fraction, take_profit_delta).
+    Патчи A/F: профиль выхода зависит от цены входа.
+    Возвращает (partial_take_delta, partial_take_fraction, take_profit_delta, stop_loss_delta).
+    stop_loss_delta == None → стоп выключен (едем до TP/разрешения).
 
     • Дешёвый лонгшот (вход < cheap_entry_max): не фиксируем частично, едем до
-      широкого TP/разрешения — именно тут живёт правый хвост (мунбэги).
-    • Дорогой фаворит (вход >= expensive_entry_min): апсайд мал, забираем быстро.
-    • Середина: базовый профиль (флип на +5c, TP +10c).
+      широкого TP/разрешения — именно тут живёт правый хвост (мунбэги); стоп выключен,
+      чтобы шум рынка не выбивал позицию до разрешения (патч F).
+    • Дорогой фаворит (вход >= expensive_entry_min): апсайд мал, забираем быстро,
+      стоп −15c оправдан.
+    • Середина: базовый профиль (флип на +5c, TP +10c, SL базовый).
     """
     t = CONFIG.trading
     if entry < t.cheap_entry_max:
-        return t.partial_take_delta, t.cheap_partial_take_fraction, t.cheap_take_profit_delta
+        return (t.partial_take_delta, t.cheap_partial_take_fraction,
+                t.cheap_take_profit_delta, t.cheap_stop_loss_delta)
     if entry >= t.expensive_entry_min:
-        return t.expensive_partial_take_delta, t.partial_take_fraction, t.expensive_take_profit_delta
-    return t.partial_take_delta, t.partial_take_fraction, t.take_profit_delta
+        return (t.expensive_partial_take_delta, t.partial_take_fraction,
+                t.expensive_take_profit_delta, t.expensive_stop_loss_delta)
+    return (t.partial_take_delta, t.partial_take_fraction,
+            t.take_profit_delta, t.stop_loss_delta)
 
 
 def manage_positions():
@@ -263,8 +269,8 @@ def manage_positions():
                 # не работают (при входе 0.9 даже +25% недостижимы).
                 change = cur - entry
 
-                # Патч A: профиль выхода зависит от цены входа (флип/TP).
-                ptake_delta, ptake_frac, tp_delta = exit_params(entry)
+                # Патчи A/F: профиль выхода зависит от цены входа (флип/TP/SL).
+                ptake_delta, ptake_frac, tp_delta, sl_delta = exit_params(entry)
 
                 # Флиппинг (из требований): вероятность сместилась в нашу сторону →
                 # фиксируем часть позиции, остаток едет до TP/SL/разрешения.
@@ -293,7 +299,9 @@ def manage_positions():
                         bal = get_usdc_balance()
                         notifier.send(_close_msg("✅ TAKE PROFIT", p, entry, cur, bal))
                     continue
-                if change <= CONFIG.trading.stop_loss_delta:
+                # Патч F: для дешёвых входов sl_delta=None → стоп выключен,
+                # позиция едет до TP/разрешения (шум рынка её не выбивает).
+                if sl_delta is not None and change <= sl_delta:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
                         bal = get_usdc_balance()

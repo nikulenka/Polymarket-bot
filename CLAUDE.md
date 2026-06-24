@@ -1,5 +1,8 @@
 # CLAUDE.md — Руководство по проекту Polymarket Whale Tracker
 
+## Бизнес-контекст
+См. `/Users/vitalyn/MyDocuments/00 My Projects/00 brain/projects/polymarket-bot/` (business.md, architecture.md, retro/).
+
 ## Что это за проект
 
 Бот копирует сделки «умных денег» на Polymarket. Стратегия: найти кошельки с WinRate ≥ 80% и PnL ≥ $100k (или молодые инсайдерские), дождаться их консенсусной ставки, отправить алерт в Telegram и опционально повторить сделку.
@@ -60,7 +63,7 @@ src/logger.py   → логирование
 
 ```bash
 # Окружение (общий .venv для всех проектов Antigravity)
-source "/Users/vitalyn/00 Antigravity/.venv/bin/activate"
+source "/Users/vitalyn/MyDocuments/00 My Projects/.venv/bin/activate"
 export PYTHONPATH=.
 
 # Собрать китов (первый раз и по cron)
@@ -109,7 +112,7 @@ python3 -m unittest tests.test_bot -v
 | `PYTHONPATH` | Всегда `export PYTHONPATH=.` или `python3 -m src.tracker`. Без этого `from src.` не работает |
 | Батчинг Telegram | Сообщения идут через `notifier.send()`, отправляются батчем. Не создавай параллельный batcher |
 | Возраст кошелька | `get_first_trade_ts()` пагинирует до `max_pages=4` (2000 сделок). Если история глубже — возвращает `None` («возраст неизвестен»), а НЕ min из последних сделок: иначе гиперактивный бот, у которого 2000 сделок за сутки, ложно помечается «молодым инсайдером» |
-| TP/SL на бинарных рынках | Только в пунктах вероятности (`take_profit_delta`/`stop_loss_delta`), не в % от цены: при входе по 0.9 «+25%» недостижимы. С патча A (2026-06-19) пороги ещё и зависят от цены входа — см. `exit_params()` |
+| TP/SL на бинарных рынках | Только в пунктах вероятности (`take_profit_delta`/`stop_loss_delta`), не в % от цены: при входе по 0.9 «+25%» недостижимы. С патча A (2026-06-19) TP/флип зависят от цены входа, с патча F (2026-06-24) — и SL тоже (для дешёвых входов `< 0.35` стоп выключен, `sl_delta=None`). См. `exit_params()`, возвращает кортеж из 4 значений |
 | Цена входа | Входим по текущему ask (`api.get_price(token_id, side="buy")`), не по цене сделки кита — ей может быть до 12 часов. При SELL-сигнале покупается противоположный токен, его справедливая цена ≈ 1 − цена кита |
 | Разрешённый рынок | CLOB `/price` отдаёт 404 → исход берём из `api.get_market_resolution()` и закрываем по 1.0/0.0. Закрытие «по входу» конфискует выигрыши |
 
@@ -117,12 +120,12 @@ python3 -m unittest tests.test_bot -v
 
 ## Тесты
 
-`tests/test_bot.py` — 51 mock-тест без сетевых вызовов. Проверяют:
+`tests/test_bot.py` — 53 mock-теста без сетевых вызовов. Проверяют:
 - `TestNotional` — правильность расчёта notional
 - `TestScoutScoring` — WinRate/PnL/инсайдер скоринг
 - `TestEngine` — консенсус, MEV-мьют, объём, дельта-нейтрал
 - `TestCapitalManagement` — Kelly-сайзинг, тиерный кап, лимиты входа, дневной стоп
-- `TestExitProfile` — профиль выхода (`exit_params`) по цене входа
+- `TestExitProfile` — профиль выхода (`exit_params`) по цене входа: TP/флип (патч A) и SL (патч F, дешёвый вход без стопа, дорогой со стопом)
 - `TestSignalGates` — гейты одиночного `trusted_whale` (фавориты/SELL/нет края)
 - `TestMarketFilter` — regex фильтр спорта/шума
 - `TestDB` — SQLite roundtrip, дедупликация tx
@@ -137,13 +140,13 @@ python3 -m unittest tests.test_bot -v
 Проект использует **общий `.venv`** для всех Antigravity-проектов:
 
 ```
-/Users/vitalyn/00 Antigravity/.venv/
+/Users/vitalyn/MyDocuments/00 My Projects/.venv/
 ```
 
 **Никогда не создавай локальный `venv/` в папке проекта.** Если нужен новый пакет — устанавливай в общий:
 
 ```bash
-"/Users/vitalyn/00 Antigravity/.venv/bin/pip" install <package>
+"/Users/vitalyn/MyDocuments/00 My Projects/.venv/bin/pip" install <package>
 ```
 
 Затем добавь его в `requirements.txt`.
@@ -208,16 +211,18 @@ signal_outcomes (
 
 **Управление капиталом (`src/tracker.py`):** размер позиции — fractional Kelly `position_size_usd()` (0.25 Келли); кап банкролла зависит от цены входа — 2% обычно, **4% для дешёвых входов** (`< cheap_entry_max=0.35`, см. патч B ниже). Лимиты `entry_blocked()` — максимум 10 позиций, одна на рынок. Дневной стоп `daily_stop_active()` — просадка ≥ 5% за день UTC → пауза входов до завтра (состояние в `data/metrics.json`).
 
-**Профиль выхода зависит от цены входа** (`exit_params()` в `src/tracker.py`, патч A от 2026-06-19) — TP/флип не фиксированы, а считаются по входу:
-- дешёвый лонгшот (вход `< 0.35`): флип **выключен** (`cheap_partial_take_fraction=0`), широкий TP `+0.45` — едет до разрешения. Дешёвые входы дают мунбэги (×3–×5), флип на +5ц их обрубает.
-- дорогой фаворит (вход `≥ 0.50`): быстрый флип на `+0.03`, узкий TP `+0.06` — апсайд там мал, забираем быстро.
-- середина (`0.35–0.50`): базовый профиль — флип `+0.05` (50% позиции), TP `+0.10`, SL `−0.15` (без изменений).
+**Профиль выхода зависит от цены входа** (`exit_params()` в `src/tracker.py`, патч A от 2026-06-19, патч F от 2026-06-24) — TP/флип/SL не фиксированы, а считаются по входу. `exit_params()` возвращает кортеж `(partial_take_delta, partial_take_fraction, take_profit_delta, stop_loss_delta)`, где `stop_loss_delta == None` → стоп выключен:
+- дешёвый лонгшот (вход `< 0.35`): флип **выключен** (`cheap_partial_take_fraction=0`), широкий TP `+0.45`, **стоп выключен** (`cheap_stop_loss_delta=None`, патч F) — едет до разрешения. Дешёвые входы дают мунбэги (×3–×5), флип на +5ц их обрубает, а плоский стоп −15ц выбивает их рыночным шумом до разрешения (вход 0.18 → −15ц это −83% капитала позиции).
+- дорогой фаворит (вход `≥ 0.50`): быстрый флип на `+0.03`, узкий TP `+0.06`, стоп `−0.15` (`expensive_stop_loss_delta`) — апсайд там мал, забираем быстро, риск режем.
+- середина (`0.35–0.50`): базовый профиль — флип `+0.05` (50% позиции), TP `+0.10`, SL `−0.15`.
+
+**Патч F (2026-06-24, почему):** анализ paper-торговли 10–24 июня — слив −$89 при том, что 70% сигналов в итоге правы. Деньги терялись на ВЫХОДЕ: 22 стоп-лосса = −$210, почти все на дешёвых входах, выбитых шумом за 15мин–6ч ДО разрешения. Раньше стоп был плоским `−0.15` для всех; теперь зависит от цены входа, как уже было сделано для TP патчем A.
 
 **Гейты одиночного сигнала** (патчи B/C в `execute_trade()`, `src/tracker.py`) — применяются ТОЛЬКО к `signal_type == "trusted_whale"` (одиночный элитный кит); консенсус (`signal_type == "consensus"`) их не проходит, его край в группе, а не в WinRate одного кита:
 - цена входа `≥ single_whale_max_price` (0.50) → скип, фавориты только консенсусом.
 - `side == "SELL"` и `single_whale_allow_sell=False` (дефолт) → скип — SELL одиночных китов исторически даёт низкую правоту.
 - `skip_when_no_edge=True` (дефолт) и `WinRate кита ≤ цена` → скип вместо ставки минимального размера ($2 в никуда).
 
-Все пороги выше переопределяются через `.env` (см. `.env.example`) — `CHEAP_ENTRY_MAX`, `CHEAP_TAKE_PROFIT_DELTA`, `POSITION_MAX_PCT_CHEAP`, `SINGLE_WHALE_MAX_PRICE`, `SINGLE_WHALE_ALLOW_SELL`, `SKIP_WHEN_NO_EDGE`, `KELLY_FRACTION`, `PAPER_START_BALANCE`.
+Все пороги выше переопределяются через `.env` (см. `.env.example`) — `CHEAP_ENTRY_MAX`, `CHEAP_TAKE_PROFIT_DELTA`, `CHEAP_STOP_LOSS_DELTA` (`none`/`off` = стоп выкл), `EXPENSIVE_STOP_LOSS_DELTA`, `POSITION_MAX_PCT_CHEAP`, `SINGLE_WHALE_MAX_PRICE`, `SINGLE_WHALE_ALLOW_SELL`, `SKIP_WHEN_NO_EDGE`, `KELLY_FRACTION`, `PAPER_START_BALANCE`.
 
 **Диагностика правоты сигналов** — `db.signal_outcome_breakdown()` (патч E) даёт разбивку правоты по стороне/типу/цене входа; видна и в `scripts/calibration_check.py`, и в ежедневном heartbeat (`maybe_daily_report()`).

@@ -33,6 +33,19 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_float_or_none(name: str, default):
+    """Как _env_float, но "none"/"off"/"" → None (стоп выключен)."""
+    val = os.getenv(name)
+    if val is None:
+        return default
+    if val.strip().lower() in ("none", "off", ""):
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
+
 def _env_int(name: str, default: int) -> int:
     val = os.getenv(name)
     try:
@@ -165,6 +178,17 @@ class TradingConfig:
     expensive_entry_min: float = 0.50
     expensive_take_profit_delta: float = 0.06
     expensive_partial_take_delta: float = 0.03
+
+    # --- Патч F: стоп-лосс тоже зависит от цены входа ---
+    # Анализ 10–24 июня: 22 стоп-лосса = −$210 при общем сливе −$89, при том что
+    # 70% сигналов в итоге правы. Плоский −15c выбивает дешёвые лонгшоты шумом
+    # (вход 0.18 → −15c это −83% капитала позиции, но всего один тик рынка)
+    # ДО разрешения, где у них и зашит правый хвост. Поэтому:
+    #   дешёвый вход (< cheap_entry_max): стоп выключен (None), едем до разрешения;
+    #   дорогой фаворит (>= expensive_entry_min): −15c оправдан (апсайд мал, режем риск);
+    #   середина: базовый stop_loss_delta.
+    cheap_stop_loss_delta: float | None = None     # None = без стопа для дешёвых входов
+    expensive_stop_loss_delta: float = -0.15
 
     # --- Патч B: повышенный кап для дешёвых входов (асимметричный край) ---
     # Корзина <0.5 дала +$147, корзина 0.5–0.7 дала −$16: концентрируем капитал
@@ -317,6 +341,8 @@ def load_config() -> BotConfig:
     config.trading.stop_loss_delta = _env_float("STOP_LOSS_DELTA", config.trading.stop_loss_delta)
     config.trading.cheap_entry_max = _env_float("CHEAP_ENTRY_MAX", config.trading.cheap_entry_max)
     config.trading.cheap_take_profit_delta = _env_float("CHEAP_TAKE_PROFIT_DELTA", config.trading.cheap_take_profit_delta)
+    config.trading.cheap_stop_loss_delta = _env_float_or_none("CHEAP_STOP_LOSS_DELTA", config.trading.cheap_stop_loss_delta)
+    config.trading.expensive_stop_loss_delta = _env_float("EXPENSIVE_STOP_LOSS_DELTA", config.trading.expensive_stop_loss_delta)
     config.trading.single_whale_max_price = _env_float("SINGLE_WHALE_MAX_PRICE", config.trading.single_whale_max_price)
     config.trading.single_whale_allow_sell = _env_bool("SINGLE_WHALE_ALLOW_SELL", config.trading.single_whale_allow_sell)
     config.trading.skip_when_no_edge = _env_bool("SKIP_WHEN_NO_EDGE", config.trading.skip_when_no_edge)

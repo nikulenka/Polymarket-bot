@@ -2,7 +2,7 @@
 # Запуск Live Tracker (модуль 2). Единственный путь запуска:
 # убивает предыдущий экземпляр по pid-файлу, чтобы не было двух трекеров
 # (двойные сигналы/позиции + старый код в памяти).
-source "/Users/vitalyn/00 Antigravity/.venv/bin/activate"
+source "/Users/vitalyn/MyDocuments/00 My Projects/.venv/bin/activate"
 cd "$(dirname "$0")" || exit
 export PYTHONPATH=.
 

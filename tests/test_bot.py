@@ -314,27 +314,49 @@ class TestCapitalManagement(unittest.TestCase):
 
 
 class TestExitProfile(unittest.TestCase):
-    """Патч A: профиль выхода зависит от цены входа."""
+    """Патчи A/F: профиль выхода (TP/флип/SL) зависит от цены входа."""
 
     def test_cheap_entry_disables_partial_and_widens_tp(self):
         from src.tracker import exit_params
-        _, frac, tp = exit_params(0.20)  # дешёвый лонгшот
+        _, frac, tp, sl = exit_params(0.20)  # дешёвый лонгшот
         self.assertEqual(frac, CONFIG.trading.cheap_partial_take_fraction)  # 0 → флип выкл
         self.assertEqual(tp, CONFIG.trading.cheap_take_profit_delta)        # широкий TP
+        self.assertIsNone(sl)  # патч F: стоп выключен — едем до разрешения
 
     def test_expensive_entry_takes_fast(self):
         from src.tracker import exit_params
-        pdelta, frac, tp = exit_params(0.70)  # фаворит
+        pdelta, frac, tp, sl = exit_params(0.70)  # фаворит
         self.assertEqual(tp, CONFIG.trading.expensive_take_profit_delta)
         self.assertEqual(pdelta, CONFIG.trading.expensive_partial_take_delta)
         self.assertGreater(frac, 0)
+        self.assertEqual(sl, CONFIG.trading.expensive_stop_loss_delta)  # патч F: −15c оправдан
 
     def test_mid_entry_uses_base_profile(self):
         from src.tracker import exit_params
-        pdelta, frac, tp = exit_params(0.42)  # середина
+        pdelta, frac, tp, sl = exit_params(0.42)  # середина
         self.assertEqual(tp, CONFIG.trading.take_profit_delta)
         self.assertEqual(frac, CONFIG.trading.partial_take_fraction)
         self.assertEqual(pdelta, CONFIG.trading.partial_take_delta)
+        self.assertEqual(sl, CONFIG.trading.stop_loss_delta)  # патч F: базовый стоп
+
+    def test_cheap_entry_never_stops_out(self):
+        """Патч F: дешёвый вход 0.18, упавший на −16c (тот самый кейс из
+        анализа 10–24 июня, выбивавший позицию в минус), стоп НЕ срабатывает."""
+        from src.tracker import exit_params
+        entry = 0.18
+        _, _, _, sl = exit_params(entry)
+        change = 0.02 - entry  # цена ушла к 0.02 → −0.16
+        stopped = sl is not None and change <= sl
+        self.assertFalse(stopped)  # едем до разрешения, а не режем шумом
+
+    def test_expensive_entry_stops_out_on_15c_drop(self):
+        """Дорогой фаворит со стопом −15c: падение на 16c закрывает позицию."""
+        from src.tracker import exit_params
+        entry = 0.70
+        _, _, _, sl = exit_params(entry)
+        change = 0.54 - entry  # −0.16
+        self.assertIsNotNone(sl)
+        self.assertTrue(change <= sl)
 
 
 class TestSignalGates(unittest.TestCase):

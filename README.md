@@ -57,7 +57,7 @@
 
 ```bash
 # Общий .venv для всех проектов Antigravity (используется всеми ботами)
-source "/Users/vitalyn/00 Antigravity/.venv/bin/activate"
+source "/Users/vitalyn/MyDocuments/00 My Projects/.venv/bin/activate"
 
 # Зависимости уже установлены. Если нужно переустановить:
 pip install -r requirements.txt
@@ -131,7 +131,7 @@ SCOUT_MIN_PNL=100000
 PYTHONPATH=. python3 -m unittest tests.test_bot -v
 ```
 
-16 mock-тестов: API notional, скоринг WinRate/PnL, консенсус, MEV-мьют, дельта-нейтрал, фильтр рынков, SQLite roundtrip, формат алерта.
+53 mock-теста: API notional, скоринг WinRate/PnL, консенсус, MEV-мьют, дельта-нейтрал, фильтр рынков, управление капиталом (Kelly-сайзинг, дневной стоп), профиль выхода по цене входа (TP/флип/SL), гейты одиночного сигнала, разрешение рынков, SQLite roundtrip, формат алерта.
 
 ---
 
@@ -148,7 +148,7 @@ update_daily.sh ежедневный рескан китов + рестарт
 .env.example    шаблон переменных окружения
 ```
 ## Шпаргалка по управлению:
-- ssh root@92.62.132.69 | #вход теперь по ключу, без пароля
-- journalctl -u polymarket-tracker -f | #живые логи
-- sudo systemctl restart polymarket-tracker | #перезапуск
-- cd /root/polymarket-bot && git pull && sudo systemctl restart polymarket-tracker | #обновление
+- `ssh polymarket` | #алиас в ~/.ssh/config → root@92.62.132.69, вход по ключу id_ed25519
+- `journalctl -u polymarket-tracker -f` | #живые логи
+- `sudo systemctl restart polymarket-tracker` | #перезапуск
+- `cd /root/polymarket-bot && git pull && sudo systemctl restart polymarket-tracker` | #обновление
