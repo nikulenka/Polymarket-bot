@@ -502,13 +502,23 @@ class TestNotifier(unittest.TestCase):
                   "consensus_outcome": "yes", "median_price": 0.62, "delta_neutral": True,
                   "market": "Will the Fed cut rates?", "cond_id": "c1", "event_slug": "fed-cut"}
         whales = [{"winrate": 0.88, "total_pnl": 1_200_000, "is_insider": True, "age_days": 9}]
-        msg = n.format_signal(1, signal, whales, "✅ PAPER: BUY")
+        msg = n.format_signal(1, signal, whales, "✅ PAPER: BUY", balance=1050.0)
         self.assertIn("polymarket.com/event/fed-cut", msg)  # ссылка
         self.assertIn("BUY", msg)                            # сторона
         self.assertIn("0.62", msg)                           # цена входа
         self.assertIn("WinRate", msg)                        # стата кошелька
         self.assertIn("INSIDER", msg)                        # инсайдер-метка
         self.assertIn("дельта", msg.lower())                 # риск-флаг
+        self.assertIn("Баланс", msg)                         # состояние счёта
+        self.assertIn("от старта", msg)                      # итоговый P&L
+
+    def test_balance_line_pnl_sign(self):
+        n = notifier.Notifier()
+        start = CONFIG.trading.paper_start_balance
+        up = n.balance_line(start + 25.0)
+        down = n.balance_line(start - 40.0)
+        self.assertIn("+25.00$", up)    # прибыль со знаком +
+        self.assertIn("-40.00$", down)  # убыток со знаком −
 
 
 if __name__ == "__main__":

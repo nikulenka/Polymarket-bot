@@ -141,7 +141,7 @@ def resolve_token_id(tokens_map, target_outcome, signal_side):
 
 
 def _close_msg(label: str, p: dict, entry: float, exit_price: float, balance: float) -> str:
-    """Сообщение о закрытии позиции с P&L и состоянием счёта."""
+    """Сообщение о закрытии позиции с P&L сделки и состоянием счёта."""
     tokens = p.get("tokens", 0)
     cost = tokens * entry
     proceeds = tokens * exit_price
@@ -166,8 +166,8 @@ def _close_msg(label: str, p: dict, entry: float, exit_price: float, balance: fl
         f"<b>{label}</b> [{mode}]\n"
         f"{market}\n"
         f"Вход: {entry:.3f} → Выход: {exit_price:.3f}\n"
-        f"P&L: <b>{pnl_sign}{pnl:.2f}$</b> ({pnl_sign}{pnl_pct:.1f}%)\n"
-        f"💼 Баланс: ${balance:.2f} (итого {total_sign}{total_pnl:.2f}$ от старта)"
+        f"P&L сделки: <b>{pnl_sign}{pnl:.2f}$</b> ({pnl_sign}{pnl_pct:.1f}%)\n"
+        f"{notifier.balance_line(balance)}"
     )
 
 
@@ -289,8 +289,8 @@ def manage_positions():
                             f"💰 <b>ЧАСТИЧНАЯ ФИКСАЦИЯ</b> [{'PAPER' if CONFIG.trading.paper_mode else 'LIVE'}]\n"
                             f"{p.get('market', '')[:80]}\n"
                             f"Продано {part:.1f} шеров @ {cur:.3f} (вход {entry:.3f}), "
-                            f"+{pnl:.2f}$ | остаток {p['tokens']:.1f} шеров\n"
-                            f"💼 Баланс: ${bal:.2f}"
+                            f"P&L сделки: +{pnl:.2f}$ | остаток {p['tokens']:.1f} шеров\n"
+                            f"{notifier.balance_line(bal)}"
                         )
 
                 if change >= tp_delta:
@@ -396,7 +396,8 @@ def daily_stop_active(balance):
             _save_metrics(m)
             notifier.send(
                 f"⛔ <b>Дневной стоп-лосс</b>: просадка −{drawdown*100:.1f}% "
-                f"(${start:.2f} → ${balance:.2f}). Новые входы на паузе до завтра (UTC)."
+                f"(${start:.2f} → ${balance:.2f}). Новые входы на паузе до завтра (UTC).\n"
+                f"{notifier.balance_line(balance)}"
             )
             notifier.flush()
         return True
@@ -526,11 +527,8 @@ def maybe_daily_report():
     elite = _load_elite()
     positions = load_positions()
     balance = get_usdc_balance()
-    start = CONFIG.trading.paper_start_balance
     s = db.signal_outcome_summary()
     winshare = f"{s['wins']}/{s['resolved']}" if s["resolved"] else "—"
-    total_pnl = balance - start
-    sign = "+" if total_pnl >= 0 else ""
     mode = "PAPER" if CONFIG.trading.paper_mode else "LIVE"
 
     # Патч E: правота по стороне (BUY/SELL) — видно, не тащит ли SELL вниз.
@@ -548,7 +546,7 @@ def maybe_daily_report():
         f"Сигналов всего: {s['total']} | разрешено: {s['resolved']} | правота китов: {winshare}"
         f"{side_line}\n"
         f"Открытых позиций: {len(positions)}\n"
-        f"💼 Баланс: ${balance:.2f} ({sign}{total_pnl:.2f}$ от старта)"
+        f"{notifier.balance_line(balance)}"
     )
     notifier.flush()
 
@@ -740,7 +738,19 @@ def run():
                         db.touch_last_active(e["wallet"])
 
                 trade_status = execute_trade(signal, positions, whale_stats)
-                msg = notifier.format_signal(signal_id, signal, whale_stats, trade_status)
+                balance = get_usdc_balance()
+                msg = notifier.format_signal(signal_id, signal, whale_stats, trade_status, balance)
+
+                # В Telegram шлём только сигналы, по которым что-то произошло
+                # (реальный вход, ошибка ордера, дневной стоп). Рутинные
+                # «⏭ Пропуск …» по фильтрам в канал не идут — только в лог.
+                # Сигнал всё равно записан в signal_outcomes для оценки кита.
+                if trade_status.startswith("⏭ Пропуск"):
+                    logger.info("СИГНАЛ (не отправлен, пропуск): " + " | ".join(
+                        msg.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","").split("\n")))
+                    print(f"\n{'='*50}\n[не отправлен в TG — пропуск]\n{msg}\n{'='*50}\n")
+                    continue
+
                 notifier.send(msg)
                 notifier.flush()  # сигнал → немедленная доставка, не ждём батч-таймер
                 logger.info(" | ".join(msg.replace("<b>","").replace("</b>","").replace("<i>","").replace("</i>","").split("\n")))

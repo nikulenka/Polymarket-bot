@@ -62,6 +62,18 @@ class Notifier:
         return CONFIG.api.site_url
 
     @staticmethod
+    def balance_line(balance: float) -> str:
+        """
+        Единая строка состояния счёта для всех сообщений: текущий баланс
+        и итоговый P&L от стартового банкролла. Чтобы в каждом алерте было
+        видно, как меняется баланс.
+        """
+        start = CONFIG.trading.paper_start_balance
+        total_pnl = balance - start
+        sign = "+" if total_pnl >= 0 else ""
+        return f"💼 Баланс: ${balance:.2f} (итого {sign}{total_pnl:.2f}$ от старта)"
+
+    @staticmethod
     def _whale_summary(whales: List[Dict[str, Any]]) -> str:
         """Агрегированная стата по кошелькам сигнала."""
         if not whales:
@@ -81,7 +93,8 @@ class Notifier:
         return " | ".join(parts)
 
     def format_signal(self, n: int, signal: Dict[str, Any],
-                      whales: List[Dict[str, Any]], trade_status: str) -> str:
+                      whales: List[Dict[str, Any]], trade_status: str,
+                      balance: float) -> str:
         """Собирает HTML-сообщение для Telegram."""
         side = signal["side"]
         outcome = signal.get("consensus_outcome") or "?"
@@ -102,4 +115,5 @@ class Notifier:
         if signal.get("delta_neutral"):
             lines.append("⚠️ <i>Возможен дельта-нейтральный хедж — односторонняя ставка рискованна</i>")
         lines.append(f"<b>{escape(trade_status)}</b>")
+        lines.append(self.balance_line(balance))
         return "\n".join(lines)
