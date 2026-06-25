@@ -110,6 +110,11 @@ def save_positions(pos):
         json.dump(pos, f, indent=2)
 
 
+def committed_value(positions: dict) -> float:
+    """Сумма по цене входа (cost basis), вложенная в открытые позиции сейчас."""
+    return sum(p.get("entry_price", 0) * p.get("tokens", 0) for p in positions.values())
+
+
 def resolve_token_id(tokens_map, target_outcome, signal_side):
     """
     BUY-сигнал → покупаем токен target_outcome.
@@ -140,7 +145,7 @@ def resolve_token_id(tokens_map, target_outcome, signal_side):
     return None, None
 
 
-def _close_msg(label: str, p: dict, entry: float, exit_price: float, balance: float) -> str:
+def _close_msg(label: str, p: dict, entry: float, exit_price: float, balance: float, committed: float = 0.0) -> str:
     """Сообщение о закрытии позиции с P&L сделки и состоянием счёта."""
     tokens = p.get("tokens", 0)
     cost = tokens * entry
@@ -167,7 +172,7 @@ def _close_msg(label: str, p: dict, entry: float, exit_price: float, balance: fl
         f"{market}\n"
         f"Вход: {entry:.3f} → Выход: {exit_price:.3f}\n"
         f"P&L сделки: <b>{pnl_sign}{pnl:.2f}$</b> ({pnl_sign}{pnl_pct:.1f}%)\n"
-        f"{notifier.balance_line(balance)}"
+        f"{notifier.balance_line(balance, committed)}"
     )
 
 
@@ -238,7 +243,8 @@ def manage_positions():
                     if _settle_resolved(token_id, p, exit_price):
                         to_delete.append(token_id)
                         bal = get_usdc_balance()
-                        notifier.send(_close_msg(label, p, entry, exit_price, bal))
+                        rest = committed_value({k: v for k, v in positions.items() if k != token_id})
+                        notifier.send(_close_msg(label, p, entry, exit_price, bal, rest))
                 else:
                     # Исход ещё не известен (или позиция без cond_id — старый формат).
                     # Ждём grace-период после close_at, потом закрываем нейтрально.
@@ -247,7 +253,8 @@ def manage_positions():
                         if close_position(token_id, p["tokens"], entry):
                             to_delete.append(token_id)
                             bal = get_usdc_balance()
-                            notifier.send(_close_msg("⏰ РЫНОК РАЗРЕШИЛСЯ (исход неизвестен)", p, entry, entry, bal))
+                            rest = committed_value({k: v for k, v in positions.items() if k != token_id})
+                            notifier.send(_close_msg("⏰ РЫНОК РАЗРЕШИЛСЯ (исход неизвестен)", p, entry, entry, bal, rest))
                 continue
 
             if entry > 0:
@@ -256,13 +263,15 @@ def manage_positions():
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
                         bal = get_usdc_balance()
-                        notifier.send(_close_msg("✅ РЫНОК ВЫИГРАЛ", p, entry, cur, bal))
+                        rest = committed_value({k: v for k, v in positions.items() if k != token_id})
+                        notifier.send(_close_msg("✅ РЫНОК ВЫИГРАЛ", p, entry, cur, bal, rest))
                     continue
                 if cur <= 0.03:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
                         bal = get_usdc_balance()
-                        notifier.send(_close_msg("❌ РЫНОК ПРОИГРАЛ", p, entry, cur, bal))
+                        rest = committed_value({k: v for k, v in positions.items() if k != token_id})
+                        notifier.send(_close_msg("❌ РЫНОК ПРОИГРАЛ", p, entry, cur, bal, rest))
                     continue
 
                 # TP/SL в пунктах вероятности: на бинарном рынке проценты от цены
@@ -285,19 +294,21 @@ def manage_positions():
                         dirty = True
                         bal = get_usdc_balance()
                         pnl = part * (cur - entry)
+                        rest = committed_value(positions)  # позиция остаётся открытой, только урезана
                         notifier.send(
                             f"💰 <b>ЧАСТИЧНАЯ ФИКСАЦИЯ</b> [{'PAPER' if CONFIG.trading.paper_mode else 'LIVE'}]\n"
                             f"{p.get('market', '')[:80]}\n"
                             f"Продано {part:.1f} шеров @ {cur:.3f} (вход {entry:.3f}), "
                             f"P&L сделки: +{pnl:.2f}$ | остаток {p['tokens']:.1f} шеров\n"
-                            f"{notifier.balance_line(bal)}"
+                            f"{notifier.balance_line(bal, rest)}"
                         )
 
                 if change >= tp_delta:
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
                         bal = get_usdc_balance()
-                        notifier.send(_close_msg("✅ TAKE PROFIT", p, entry, cur, bal))
+                        rest = committed_value({k: v for k, v in positions.items() if k != token_id})
+                        notifier.send(_close_msg("✅ TAKE PROFIT", p, entry, cur, bal, rest))
                     continue
                 # Патч F: для дешёвых входов sl_delta=None → стоп выключен,
                 # позиция едет до TP/разрешения (шум рынка её не выбивает).
@@ -305,14 +316,16 @@ def manage_positions():
                     if close_position(token_id, p["tokens"], cur):
                         to_delete.append(token_id)
                         bal = get_usdc_balance()
-                        notifier.send(_close_msg("🛑 STOP LOSS", p, entry, cur, bal))
+                        rest = committed_value({k: v for k, v in positions.items() if k != token_id})
+                        notifier.send(_close_msg("🛑 STOP LOSS", p, entry, cur, bal, rest))
                     continue
 
             if now > close_at:
                 if close_position(token_id, p["tokens"], cur):
                     to_delete.append(token_id)
                     bal = get_usdc_balance()
-                    notifier.send(_close_msg("⏰ ВРЕМЯ ВЫШЛО", p, entry, cur, bal))
+                    rest = committed_value({k: v for k, v in positions.items() if k != token_id})
+                    notifier.send(_close_msg("⏰ ВРЕМЯ ВЫШЛО", p, entry, cur, bal, rest))
         except Exception as e:
             logger.error(f"manage_positions {token_id}: {e}")
 
@@ -397,7 +410,7 @@ def daily_stop_active(balance):
             notifier.send(
                 f"⛔ <b>Дневной стоп-лосс</b>: просадка −{drawdown*100:.1f}% "
                 f"(${start:.2f} → ${balance:.2f}). Новые входы на паузе до завтра (UTC).\n"
-                f"{notifier.balance_line(balance)}"
+                f"{notifier.balance_line(balance, committed_value(load_positions()))}"
             )
             notifier.flush()
         return True
@@ -546,7 +559,7 @@ def maybe_daily_report():
         f"Сигналов всего: {s['total']} | разрешено: {s['resolved']} | правота китов: {winshare}"
         f"{side_line}\n"
         f"Открытых позиций: {len(positions)}\n"
-        f"{notifier.balance_line(balance)}"
+        f"{notifier.balance_line(balance, committed_value(positions))}"
     )
     notifier.flush()
 
@@ -739,7 +752,8 @@ def run():
 
                 trade_status = execute_trade(signal, positions, whale_stats)
                 balance = get_usdc_balance()
-                msg = notifier.format_signal(signal_id, signal, whale_stats, trade_status, balance)
+                msg = notifier.format_signal(signal_id, signal, whale_stats, trade_status, balance,
+                                              committed_value(positions))
 
                 # В Telegram шлём только сигналы, по которым что-то произошло
                 # (реальный вход, ошибка ордера, дневной стоп). Рутинные

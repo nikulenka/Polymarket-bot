@@ -62,16 +62,30 @@ class Notifier:
         return CONFIG.api.site_url
 
     @staticmethod
-    def balance_line(balance: float) -> str:
+    def balance_line(balance: float, committed: float = 0.0) -> str:
         """
         Единая строка состояния счёта для всех сообщений: текущий баланс
         и итоговый P&L от стартового банкролла. Чтобы в каждом алерте было
         видно, как меняется баланс.
+
+        `committed` — сумма по цене входа (cost basis), вложенная в сейчас
+        открытые позиции. Без неё просадка от дневного стоп-лосса выглядит
+        больше реализованного убытка: деньги в открытых позициях не потеряны,
+        они временно не на счету. total_pnl = balance - start (видимая
+        просадка, на ней же считается дневной стоп); realized = total_pnl + committed
+        (фактический P&L закрытых сделок, без открытых позиций).
         """
         start = CONFIG.trading.paper_start_balance
         total_pnl = balance - start
         sign = "+" if total_pnl >= 0 else ""
-        return f"💼 Баланс: ${balance:.2f} (итого {sign}{total_pnl:.2f}$ от старта)"
+        if committed <= 0:
+            return f"💼 Баланс: ${balance:.2f} (итого {sign}{total_pnl:.2f}$ от старта)"
+        realized = total_pnl + committed
+        r_sign = "+" if realized >= 0 else ""
+        return (
+            f"💼 Баланс: ${balance:.2f} (итого {sign}{total_pnl:.2f}$ от старта: "
+            f"зафиксировано {r_sign}{realized:.2f}$, в открытых позициях ${committed:.2f})"
+        )
 
     @staticmethod
     def _whale_summary(whales: List[Dict[str, Any]]) -> str:
@@ -94,7 +108,7 @@ class Notifier:
 
     def format_signal(self, n: int, signal: Dict[str, Any],
                       whales: List[Dict[str, Any]], trade_status: str,
-                      balance: float) -> str:
+                      balance: float, committed: float = 0.0) -> str:
         """Собирает HTML-сообщение для Telegram."""
         side = signal["side"]
         outcome = signal.get("consensus_outcome") or "?"
@@ -115,5 +129,5 @@ class Notifier:
         if signal.get("delta_neutral"):
             lines.append("⚠️ <i>Возможен дельта-нейтральный хедж — односторонняя ставка рискованна</i>")
         lines.append(f"<b>{escape(trade_status)}</b>")
-        lines.append(self.balance_line(balance))
+        lines.append(self.balance_line(balance, committed))
         return "\n".join(lines)
