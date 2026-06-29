@@ -359,6 +359,71 @@ class TestExitProfile(unittest.TestCase):
         self.assertTrue(change <= sl)
 
 
+class TestNoiseFloorGate(unittest.TestCase):
+    """manage_positions(): порог cur<=0.03 не должен фиксировать ложный
+    проигрыш дешёвого лонгшота (стоп выключен патчем F), если Gamma не
+    подтверждает фактическое разрешение рынка — иначе шум live-рынка
+    (например, спорт в моменте) выбивает позицию тем же способом, который
+    патч F должен был устранить."""
+
+    def _position(self, entry=0.18, tokens=100.0):
+        return {
+            "tok1": {
+                "market": "Exact Score: Test 0 - 0 Test?",
+                "cond_id": "0xabc",
+                "outcome": "yes",
+                "signal_side": "BUY",
+                "entry_price": entry,
+                "tokens": tokens,
+                "opened_at": "2026-06-29T00:00:00+00:00",
+                "close_at": "2026-06-30T00:00:00+00:00",
+            }
+        }
+
+    def test_cheap_entry_unconfirmed_noise_keeps_riding(self):
+        from unittest.mock import patch
+        from src import tracker
+        positions = self._position()
+        with patch.object(tracker, "load_positions", return_value=positions), \
+             patch.object(tracker, "save_positions") as mock_save, \
+             patch.object(tracker.api, "get_price", return_value=0.02), \
+             patch.object(tracker.api, "get_market_resolution", return_value=None), \
+             patch.object(tracker, "close_position") as mock_close:
+            tracker.manage_positions()
+        mock_close.assert_not_called()
+        mock_save.assert_not_called()
+
+    def test_cheap_entry_gamma_confirmed_loss_closes_at_zero(self):
+        from unittest.mock import patch
+        from src import tracker
+        positions = self._position()
+        with patch.object(tracker, "load_positions", return_value=positions), \
+             patch.object(tracker, "save_positions") as mock_save, \
+             patch.object(tracker.api, "get_price", return_value=0.02), \
+             patch.object(tracker.api, "get_market_resolution", return_value="no"), \
+             patch.object(tracker, "close_position", return_value=True) as mock_close, \
+             patch.object(tracker, "get_usdc_balance", return_value=1000.0):
+            tracker.manage_positions()
+        mock_close.assert_called_once_with("tok1", 100.0, 0.0)
+        mock_save.assert_called_once()
+
+    def test_expensive_entry_still_closes_immediately_on_noise_floor(self):
+        """Дорогой вход со стопом — старое поведение без изменений:
+        закрывается сразу по cur, без обращения к Gamma."""
+        from unittest.mock import patch
+        from src import tracker
+        positions = self._position(entry=0.70)
+        with patch.object(tracker, "load_positions", return_value=positions), \
+             patch.object(tracker, "save_positions"), \
+             patch.object(tracker.api, "get_price", return_value=0.02), \
+             patch.object(tracker.api, "get_market_resolution") as mock_resolution, \
+             patch.object(tracker, "close_position", return_value=True) as mock_close, \
+             patch.object(tracker, "get_usdc_balance", return_value=1000.0):
+            tracker.manage_positions()
+        mock_close.assert_called_once_with("tok1", 100.0, 0.02)
+        mock_resolution.assert_not_called()
+
+
 class TestSignalGates(unittest.TestCase):
     """Патчи B/C: ограничения одиночного сигнала trusted_whale в execute_trade."""
     from unittest.mock import patch

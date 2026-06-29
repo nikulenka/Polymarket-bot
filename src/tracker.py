@@ -258,6 +258,9 @@ def manage_positions():
                 continue
 
             if entry > 0:
+                # Патчи A/F: профиль выхода зависит от цены входа (флип/TP/SL).
+                ptake_delta, ptake_frac, tp_delta, sl_delta = exit_params(entry)
+
                 # Бинарный рынок фактически решён: цена у 1.0 (WIN) или 0.0 (LOSS)
                 if cur >= 0.97:
                     if close_position(token_id, p["tokens"], cur):
@@ -267,19 +270,34 @@ def manage_positions():
                         notifier.send(_close_msg("✅ РЫНОК ВЫИГРАЛ", p, entry, cur, bal, rest))
                     continue
                 if cur <= 0.03:
-                    if close_position(token_id, p["tokens"], cur):
-                        to_delete.append(token_id)
-                        bal = get_usdc_balance()
-                        rest = committed_value({k: v for k, v in positions.items() if k != token_id})
-                        notifier.send(_close_msg("❌ РЫНОК ПРОИГРАЛ", p, entry, cur, bal, rest))
-                    continue
+                    if sl_delta is None:
+                        # Патч F: для дешёвых входов стоп выключен. 3 цента на
+                        # live-рынке (особенно спорт в моменте) часто шум игры,
+                        # а не реальное разрешение — подтверждаем через Gamma,
+                        # иначе фиксируем тот же ложный убыток, который патч F
+                        # должен был устранить.
+                        winner = api.get_market_resolution(p.get("cond_id", "")) if p.get("cond_id") else None
+                        bought = (p.get("outcome") or "").lower()
+                        if winner is not None and bought and winner != bought:
+                            if _settle_resolved(token_id, p, 0.0):
+                                to_delete.append(token_id)
+                                bal = get_usdc_balance()
+                                rest = committed_value({k: v for k, v in positions.items() if k != token_id})
+                                notifier.send(_close_msg("❌ РЫНОК ПРОИГРАЛ", p, entry, 0.0, bal, rest))
+                            continue
+                        # Не подтверждено Gamma — рынок ещё не решён, едем дальше
+                        # (до TP/close_at), стоп по-прежнему выключен.
+                    else:
+                        if close_position(token_id, p["tokens"], cur):
+                            to_delete.append(token_id)
+                            bal = get_usdc_balance()
+                            rest = committed_value({k: v for k, v in positions.items() if k != token_id})
+                            notifier.send(_close_msg("❌ РЫНОК ПРОИГРАЛ", p, entry, cur, bal, rest))
+                        continue
 
                 # TP/SL в пунктах вероятности: на бинарном рынке проценты от цены
                 # не работают (при входе 0.9 даже +25% недостижимы).
                 change = cur - entry
-
-                # Патчи A/F: профиль выхода зависит от цены входа (флип/TP/SL).
-                ptake_delta, ptake_frac, tp_delta, sl_delta = exit_params(entry)
 
                 # Флиппинг (из требований): вероятность сместилась в нашу сторону →
                 # фиксируем часть позиции, остаток едет до TP/SL/разрешения.
