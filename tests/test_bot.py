@@ -473,7 +473,9 @@ class TestSignalGates(unittest.TestCase):
         self.assertIn("края", status)
 
     def test_consensus_bypasses_single_whale_gates(self):
-        # Консенсус-сигнал в зоне фаворитов на SELL НЕ режется гейтами одиночки
+        # Консенсус-сигнал в зоне фаворитов на SELL НЕ режется гейтами одиночки.
+        # save_positions мокаем ОБЯЗАТЕЛЬНО: без мока тест пишет tok_n в
+        # реальный data/open_positions.json (поймано сверкой на проде 04.07).
         from unittest.mock import patch
         from src import tracker
         with patch.object(tracker.api, "get_market_tokens",
@@ -481,7 +483,8 @@ class TestSignalGates(unittest.TestCase):
              patch.object(tracker.api, "get_price", return_value=0.65), \
              patch.object(tracker, "get_usdc_balance", return_value=1000.0), \
              patch.object(tracker, "daily_stop_active", return_value=False), \
-             patch.object(tracker, "place_bet", return_value=True):
+             patch.object(tracker, "place_bet", return_value=True), \
+             patch.object(tracker, "save_positions"):
             # median_price=0.35 → при SELL ref=1-0.35=0.65 ≈ ask 0.65, слиппедж ок
             status = tracker.execute_trade(
                 self._signal(side="SELL", signal_type="consensus", median_price=0.35),
