@@ -8,12 +8,12 @@
 """
 
 import os
-import json
 import logging
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
+from src import state
 from src.config import CONFIG
 
 load_dotenv()
@@ -28,40 +28,39 @@ MIN_TOKENS = CONFIG.trading.min_tokens
 # ============================================================
 
 def _load_paper() -> dict:
-    path = CONFIG.files.paper_fills_file
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"balance": CONFIG.trading.paper_start_balance, "fills": []}
+    return state.load_json(
+        CONFIG.files.paper_fills_file,
+        lambda: {"balance": CONFIG.trading.paper_start_balance, "fills": []},
+    )
 
 
-def _save_paper(state: dict) -> None:
-    os.makedirs(os.path.dirname(CONFIG.files.paper_fills_file) or ".", exist_ok=True)
-    with open(CONFIG.files.paper_fills_file, "w") as f:
-        json.dump(state, f, indent=2)
+def _save_paper(st: dict) -> None:
+    state.save_json(CONFIG.files.paper_fills_file, st)
+
+
+def get_paper_fills() -> list:
+    """Лента paper-филлов (для сверки состояния при старте)."""
+    return _load_paper().get("fills", [])
 
 
 def _paper_fill(token_id: str, side: str, size: float, price: float) -> bool:
-    state = _load_paper()
+    st = _load_paper()
     cost = size * price
     if side == "BUY":
-        if state["balance"] < cost:
-            print(f"  [PAPER] Недостаточно средств: ${state['balance']:.2f} < ${cost:.2f}")
+        if st["balance"] < cost:
+            print(f"  [PAPER] Недостаточно средств: ${st['balance']:.2f} < ${cost:.2f}")
             return False
-        state["balance"] -= cost
+        st["balance"] -= cost
     else:  # SELL
-        state["balance"] += cost
-    state["fills"].append({
+        st["balance"] += cost
+    st["fills"].append({
         "ts": datetime.now(timezone.utc).isoformat(),
         "token_id": token_id, "side": side,
         "size": round(size, 4), "price": round(price, 4),
-        "cost": round(cost, 4), "balance_after": round(state["balance"], 4),
+        "cost": round(cost, 4), "balance_after": round(st["balance"], 4),
     })
-    _save_paper(state)
-    print(f"  [PAPER] {side} {size:.2f} @ {price:.4f} (${cost:.2f}) → баланс ${state['balance']:.2f}")
+    _save_paper(st)
+    print(f"  [PAPER] {side} {size:.2f} @ {price:.4f} (${cost:.2f}) → баланс ${st['balance']:.2f}")
     return True
 
 

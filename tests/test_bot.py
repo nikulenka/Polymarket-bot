@@ -253,14 +253,15 @@ class TestCapitalManagement(unittest.TestCase):
         # нет статистики китов → базовая ставка
         self.assertEqual(position_size_usd([], 0.5, 1000), CONFIG.trading.trade_amount_usd)
 
-    def test_cheap_entry_uses_higher_cap(self):
-        # Патч B: вход < cheap_entry_max → кап position_max_pct_cheap (выше базового)
+    def test_cheap_entry_cap_no_longer_boosted(self):
+        # Патч G: повышенный кап патча B отменён — бакет <0.35 дал −$236 за
+        # 19.06–03.07 при неподтверждённой правоте китов. Кап как у всех.
         from src.tracker import position_size_usd
-        # wr=0.9, цена 0.2 (< 0.35) → f* большой, упираемся в повышенный кап 4%
+        # wr=0.9, цена 0.2 (< 0.35) → f* большой, упираемся в кап cheap-бакета
         size = position_size_usd([{"winrate": 0.9}], price=0.2, balance=1000)
         self.assertAlmostEqual(size, 1000 * CONFIG.trading.position_max_pct_cheap)
-        self.assertGreater(CONFIG.trading.position_max_pct_cheap,
-                           CONFIG.trading.position_max_pct)
+        self.assertLessEqual(CONFIG.trading.position_max_pct_cheap,
+                             CONFIG.trading.position_max_pct)
 
     def test_entry_blocked_by_position_limit(self):
         from src.tracker import entry_blocked
@@ -367,6 +368,10 @@ class TestNoiseFloorGate(unittest.TestCase):
     патч F должен был устранить."""
 
     def _position(self, entry=0.18, tokens=100.0):
+        # close_at — динамический (в будущем): зашитая дата однажды протухла,
+        # и таймер времени закрывал позицию, ломая смысл теста.
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
         return {
             "tok1": {
                 "market": "Exact Score: Test 0 - 0 Test?",
@@ -375,8 +380,8 @@ class TestNoiseFloorGate(unittest.TestCase):
                 "signal_side": "BUY",
                 "entry_price": entry,
                 "tokens": tokens,
-                "opened_at": "2026-06-29T00:00:00+00:00",
-                "close_at": "2026-06-30T00:00:00+00:00",
+                "opened_at": (now - timedelta(hours=1)).isoformat(),
+                "close_at": (now + timedelta(hours=23)).isoformat(),
             }
         }
 
@@ -532,8 +537,10 @@ class TestDB(unittest.TestCase):
         unresolved = db.get_unresolved_outcomes()
         self.assertEqual(len(unresolved), 2)
 
-        db.mark_outcome_resolved(unresolved[0]["id"], "yes", won=True)
-        db.mark_outcome_resolved(unresolved[1]["id"], "no", won=False)
+        # Резолвим по cond_id, а не по индексу: порядок очереди — деталь ротации
+        by_cond = {o["cond_id"]: o for o in unresolved}
+        db.mark_outcome_resolved(by_cond["c1"]["id"], "yes", won=True)
+        db.mark_outcome_resolved(by_cond["c2"]["id"], "no", won=False)
         self.assertEqual(len(db.get_unresolved_outcomes()), 0)
 
         stats = db.whale_signal_stats()
@@ -584,6 +591,251 @@ class TestNotifier(unittest.TestCase):
         down = n.balance_line(start - 40.0)
         self.assertIn("+25.00$", up)    # прибыль со знаком +
         self.assertIn("-40.00$", down)  # убыток со знаком −
+
+
+class TestStateFiles(unittest.TestCase):
+    """Патч G: атомарная запись state-файлов и громкий отказ при битом JSON.
+    Мотив: неатомарный open('w')+dump, убитый рестартом, съел ~$179 позиций
+    (19–25.06) — файл бился, load молча возвращал {}."""
+
+    def setUp(self):
+        import tempfile
+        from src import state
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "st.json")
+        self.alerts = []
+        state.set_alert_hook(self.alerts.append)
+
+    def tearDown(self):
+        import shutil
+        from src import state
+        state.set_alert_hook(None)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_roundtrip_and_no_tmp_leftover(self):
+        from src import state
+        state.save_json(self.path, {"a": 1})
+        self.assertEqual(state.load_json(self.path, dict), {"a": 1})
+        self.assertFalse(os.path.exists(self.path + ".tmp"))  # tmp заменён атомарно
+
+    def test_missing_file_returns_default_silently(self):
+        from src import state
+        self.assertEqual(state.load_json(self.path, dict), {})
+        self.assertEqual(self.alerts, [])  # нет файла — не авария
+
+    def test_corrupt_file_quarantined_and_alerted(self):
+        from src import state
+        with open(self.path, "w") as f:
+            f.write('{"balance": 911.2, "fil')  # обрыв посреди записи
+        out = state.load_json(self.path, dict)
+        self.assertEqual(out, {})
+        self.assertEqual(len(self.alerts), 1)          # CRITICAL-алерт ушёл
+        self.assertIn("повреждён", self.alerts[0])
+        self.assertFalse(os.path.exists(self.path))     # битый файл убран...
+        quarantined = [f for f in os.listdir(self.dir) if ".corrupt-" in f]
+        self.assertEqual(len(quarantined), 1)           # ...в карантин, не удалён
+
+    def test_default_factory_not_shared(self):
+        from src import state
+        a = state.load_json(self.path, dict)
+        a["x"] = 1
+        self.assertEqual(state.load_json(self.path, dict), {})  # свежий объект
+
+
+class TestReconcile(unittest.TestCase):
+    """Патч G: сверка ленты paper-филлов с open_positions при старте."""
+
+    def _fills(self):
+        # куплено 100 tok1 (открыта) и 50 tok2, tok2 продана полностью
+        return [
+            {"token_id": "tok1", "side": "BUY", "size": 100.0},
+            {"token_id": "tok2", "side": "BUY", "size": 50.0},
+            {"token_id": "tok2", "side": "SELL", "size": 50.0},
+        ]
+
+    def test_consistent_state_is_silent(self):
+        from src.tracker import reconcile_report
+        report = reconcile_report(self._fills(), {"tok1": {"tokens": 100.0}})
+        self.assertIsNone(report)
+
+    def test_ghost_position_detected(self):
+        # tok1 куплен по филлам, но из open_positions исчез (кейс 19–25.06)
+        from src.tracker import reconcile_report
+        report = reconcile_report(self._fills(), {})
+        self.assertIsNotNone(report)
+        self.assertIn("tok1", report)
+        self.assertIn("НЕ отслеживаются", report)
+
+    def test_orphan_position_detected(self):
+        # позиция есть в файле, а филлов под неё нет
+        from src.tracker import reconcile_report
+        report = reconcile_report(self._fills(), {"tok1": {}, "tok9": {}})
+        self.assertIsNotNone(report)
+        self.assertIn("tok9", report)
+        self.assertIn("без филлов", report)
+
+    def test_partial_close_leaves_no_false_alarm(self):
+        from src.tracker import reconcile_report
+        fills = self._fills() + [{"token_id": "tok1", "side": "SELL", "size": 100.0}]
+        self.assertIsNone(reconcile_report(fills, {}))
+
+
+class TestOutcomeQueueRotation(unittest.TestCase):
+    """Патч G: очередь сверки исходов ротируется и не закупоривается."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self._orig = CONFIG.files.db_path
+        CONFIG.files.db_path = self.tmp.name
+        db.init_db()
+        for i in range(1, 5):
+            db.record_signal_outcome(
+                {"cond_id": f"c{i}", "market": "M?", "side": "BUY",
+                 "consensus_outcome": "yes", "signal_type": "consensus"},
+                ["0xaaa"], entry_price=0.5)
+
+    def tearDown(self):
+        CONFIG.files.db_path = self._orig
+        os.unlink(self.tmp.name)
+
+    def test_unchecked_come_first_newest_forward(self):
+        ids = [o["cond_id"] for o in db.get_unresolved_outcomes(limit=2)]
+        self.assertEqual(ids, ["c4", "c3"])  # свежие вперёд, а не старейшие
+
+    def test_checked_rotate_to_back_of_queue(self):
+        first = db.get_unresolved_outcomes(limit=2)
+        db.touch_outcomes_checked([o["id"] for o in first])
+        second = db.get_unresolved_outcomes(limit=2)
+        # следующий батч — те, кого ещё не проверяли (раньше застревали навсегда)
+        self.assertEqual({o["cond_id"] for o in second}, {"c1", "c2"})
+        db.touch_outcomes_checked([o["id"] for o in second])
+        third = db.get_unresolved_outcomes(limit=2)
+        # все проверены по разу → по кругу, начиная с проверенных раньше всех
+        self.assertEqual({o["cond_id"] for o in third}, {"c4", "c3"})
+
+    def test_gave_up_leaves_queue(self):
+        all_ids = [o["id"] for o in db.get_unresolved_outcomes()]
+        db.mark_outcomes_gave_up(all_ids[:2])
+        left = db.get_unresolved_outcomes()
+        self.assertEqual(len(left), 2)
+        self.assertTrue(all(o["id"] not in all_ids[:2] for o in left))
+
+    def test_check_signal_outcomes_gives_up_on_stale(self):
+        """tracker.check_signal_outcomes: древний неразрешаемый сигнал
+        помечается gave_up и больше не жуётся каждые 30 минут."""
+        from unittest.mock import patch
+        from src import tracker
+        with db._conn() as con:  # состарим один сигнал за горизонт
+            con.execute("UPDATE signal_outcomes SET created_at = ? WHERE cond_id = 'c1'",
+                        ("2026-01-01T00:00:00+00:00",))
+        with patch.object(tracker.api, "get_market_resolution", return_value=None):
+            tracker.check_signal_outcomes()
+        left = {o["cond_id"] for o in db.get_unresolved_outcomes()}
+        self.assertNotIn("c1", left)          # безнадёжный выбыл
+        self.assertEqual(left, {"c2", "c3", "c4"})
+
+
+class TestCheapEntryGates(unittest.TestCase):
+    """Патч G: лотерейный гейт и горизонт разрешения для дешёвых входов."""
+
+    def _signal(self, **over):
+        s = {"cond_id": "c1", "median_price": 0.15, "side": "BUY",
+             "consensus_outcome": "yes", "signal_type": "trusted_whale",
+             "market": "Will X?"}
+        s.update(over)
+        return s
+
+    def test_single_whale_lottery_entry_skipped(self):
+        from unittest.mock import patch
+        from src import tracker
+        with patch.object(tracker.api, "get_market_tokens",
+                          return_value={"yes": "tok_y", "no": "tok_n"}), \
+             patch.object(tracker.api, "get_price", return_value=0.15):
+            status = tracker.execute_trade(self._signal(), {}, [{"winrate": 0.9}])
+        self.assertTrue(status.startswith("⏭"), status)
+        self.assertIn("консенсус", status)
+
+    def test_consensus_lottery_entry_passes_gate(self):
+        from unittest.mock import patch, MagicMock
+        from datetime import datetime, timezone, timedelta
+        from src import tracker
+        end = datetime.now(timezone.utc) + timedelta(days=2)
+        positions = {}
+        with patch.object(tracker.api, "get_market_tokens",
+                          return_value={"yes": "tok_y", "no": "tok_n"}), \
+             patch.object(tracker.api, "get_price", return_value=0.15), \
+             patch.object(tracker.api, "get_market_end_date", return_value=end), \
+             patch.object(tracker, "get_usdc_balance", return_value=1000.0), \
+             patch.object(tracker, "daily_stop_active", return_value=False), \
+             patch.object(tracker, "place_bet", return_value=True), \
+             patch.object(tracker, "save_positions"):
+            status = tracker.execute_trade(
+                self._signal(signal_type="consensus"), positions, [])
+        self.assertFalse(status.startswith("⏭"), status)
+
+    def test_cheap_far_horizon_skipped(self):
+        """Разрешение дальше cheap_max_horizon_days → вход пропускается:
+        стопа нет, а таймер всё равно закрыл бы по шумовой цене."""
+        from unittest.mock import patch
+        from datetime import datetime, timezone, timedelta
+        from src import tracker
+        far = datetime.now(timezone.utc) + timedelta(days=30)
+        with patch.object(tracker.api, "get_market_tokens",
+                          return_value={"yes": "tok_y", "no": "tok_n"}), \
+             patch.object(tracker.api, "get_price", return_value=0.15), \
+             patch.object(tracker.api, "get_market_end_date", return_value=far):
+            status = tracker.execute_trade(
+                self._signal(signal_type="consensus"), {}, [])
+        self.assertTrue(status.startswith("⏭"), status)
+        self.assertIn("лонгшот", status)
+
+    def test_cheap_close_at_bound_to_end_date(self):
+        """close_at дешёвой позиции = endDate рынка (+буфер), не 24ч-таймер."""
+        from unittest.mock import patch
+        from datetime import datetime, timezone, timedelta
+        from src import tracker
+        end = datetime.now(timezone.utc) + timedelta(days=3)
+        positions = {}
+        with patch.object(tracker.api, "get_market_tokens",
+                          return_value={"yes": "tok_y", "no": "tok_n"}), \
+             patch.object(tracker.api, "get_price", return_value=0.15), \
+             patch.object(tracker.api, "get_market_end_date", return_value=end), \
+             patch.object(tracker, "get_usdc_balance", return_value=1000.0), \
+             patch.object(tracker, "daily_stop_active", return_value=False), \
+             patch.object(tracker, "place_bet", return_value=True), \
+             patch.object(tracker, "save_positions"):
+            status = tracker.execute_trade(
+                self._signal(signal_type="consensus"), positions, [])
+        self.assertFalse(status.startswith("⏭"), status)
+        from datetime import datetime as dt
+        close_at = dt.fromisoformat(positions["tok_y"]["close_at"])
+        self.assertEqual(close_at, end + timedelta(hours=2))
+
+    def test_mid_entry_keeps_24h_timer(self):
+        """Середина (>=0.35) не трогает Gamma и живёт по прежнему таймеру."""
+        from unittest.mock import patch
+        from datetime import datetime, timezone, timedelta
+        from src import tracker
+        positions = {}
+        with patch.object(tracker.api, "get_market_tokens",
+                          return_value={"yes": "tok_y", "no": "tok_n"}), \
+             patch.object(tracker.api, "get_price", return_value=0.45), \
+             patch.object(tracker.api, "get_market_end_date") as mock_end, \
+             patch.object(tracker, "get_usdc_balance", return_value=1000.0), \
+             patch.object(tracker, "daily_stop_active", return_value=False), \
+             patch.object(tracker, "place_bet", return_value=True), \
+             patch.object(tracker, "save_positions"):
+            status = tracker.execute_trade(
+                self._signal(signal_type="consensus", median_price=0.45),
+                positions, [])
+        self.assertFalse(status.startswith("⏭"), status)
+        mock_end.assert_not_called()
+        from datetime import datetime as dt
+        close_at = dt.fromisoformat(positions["tok_y"]["close_at"])
+        expected = datetime.now(timezone.utc) + timedelta(
+            hours=CONFIG.trading.position_hold_hours)
+        self.assertLess(abs((close_at - expected).total_seconds()), 120)
 
 
 if __name__ == "__main__":

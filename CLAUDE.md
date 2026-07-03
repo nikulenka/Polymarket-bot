@@ -20,10 +20,12 @@ src/engine.py   → модуль 3: Filter Engine (консенсус, анти-
 src/notifier.py → модуль 4: Alert Telegram
 src/trader.py   → исполнение сделок (paper / live)
 src/api.py      → единый клиент Polymarket API
-src/db.py       → SQLite (whales, tx_history)
+src/db.py       → SQLite (whales, tx_history, signal_outcomes)
 src/config.py   → вся конфигурация
 src/cache.py    → TelegramBatcher
 src/logger.py   → логирование
+src/state.py    → атомарные JSON-файлы состояния (патч G)
+scripts/        → утилиты (get_chat_id, calibration_check)
 ```
 
 ---
@@ -41,7 +43,6 @@ src/logger.py   → логирование
 **Схема полей API (проверено на живом, июнь 2026):**
 - `/trades` → поле `size` это **количество шеров**, не USDC. Notional = `size × price`. Используй `api.usdc_notional(trade)`.
 - `/positions` → `realizedPnl + cashPnl` = PnL позиции. Используй для WinRate/PnL скоринга, не парси историю разрешённых рынков через Gamma.
-- `/holders?market=<conditionId>` → топ-холдеры. Сортировка: `order=volumeNum&ascending=false` (не `volume24hr`!).
 - `/value?user=` → текущая стоимость портфеля.
 - `/v1/leaderboard?rankType=pnl` → топ-50 трейдеров по PnL (`proxyWallet`, `userName`, `pnl`). Главный источник «бриллиантовых» китов: PnL там стабильный, в отличие от шумного снапшота `/positions`. Максимум 50 записей, `window` почти не влияет.
 
@@ -62,8 +63,7 @@ src/logger.py   → логирование
 ## Запуск
 
 ```bash
-# Окружение (общий .venv для всех проектов Antigravity)
-source "/Users/vitalyn/MyDocuments/00 My Projects/.venv/bin/activate"
+# Локально хватает системного python3 (см. раздел «Python-окружение»)
 export PYTHONPATH=.
 
 # Собрать китов (первый раз и по cron)
@@ -115,41 +115,49 @@ python3 -m unittest tests.test_bot -v
 | TP/SL на бинарных рынках | Только в пунктах вероятности (`take_profit_delta`/`stop_loss_delta`), не в % от цены: при входе по 0.9 «+25%» недостижимы. С патча A (2026-06-19) TP/флип зависят от цены входа, с патча F (2026-06-24) — и SL тоже (для дешёвых входов `< 0.35` стоп выключен, `sl_delta=None`). См. `exit_params()`, возвращает кортеж из 4 значений |
 | Цена входа | Входим по текущему ask (`api.get_price(token_id, side="buy")`), не по цене сделки кита — ей может быть до 12 часов. При SELL-сигнале покупается противоположный токен, его справедливая цена ≈ 1 − цена кита |
 | Разрешённый рынок | CLOB `/price` отдаёт 404 → исход берём из `api.get_market_resolution()` и закрываем по 1.0/0.0. Закрытие «по входу» конфискует выигрыши |
+| Файлы состояния | Писать ТОЛЬКО через `src/state.py` (`save_json`/`load_json`). Прямой `open("w")+json.dump` при рестарте посреди записи бьёт файл, а тихий `except: return {}` испаряет позиции вместе с деньгами (так пропало ~$179 за 19–25.06). Битый файл уходит в `*.corrupt-<ts>` + CRITICAL-алерт; при старте `reconcile_state_on_start()` сверяет филлы с позициями |
+| Очередь сверки исходов | `db.get_unresolved_outcomes()` ротируется по `last_checked` (непроверенные свежие — первыми), безнадёжные помечаются `gave_up` (патч G). НЕ возвращать `ORDER BY created_at LIMIT N`: очередь навсегда закупоривается старейшими неразрешаемыми — с 15.06 по 03.07 было 0 сверок свежих сигналов |
+| close_at дешёвого входа | Вход `< cheap_entry_max` (стоп выключен) обязан дожить до разрешения: `close_at = endDate рынка + 2ч`, не 24ч-таймер; рынок дальше `cheap_max_horizon_days` (7дн) → вход пропускается. Иначе «ВРЕМЯ ВЫШЛО» режет лонгшоты по шумовой цене (12 случаев за 19.06–03.07) |
 
 ---
 
 ## Тесты
 
-`tests/test_bot.py` — 53 mock-теста без сетевых вызовов. Проверяют:
+`tests/test_bot.py` — 74 mock-теста без сетевых вызовов. Проверяют:
 - `TestNotional` — правильность расчёта notional
 - `TestScoutScoring` — WinRate/PnL/инсайдер скоринг
 - `TestEngine` — консенсус, MEV-мьют, объём, дельта-нейтрал
-- `TestCapitalManagement` — Kelly-сайзинг, тиерный кап, лимиты входа, дневной стоп
+- `TestCapitalManagement` — Kelly-сайзинг, капы, лимиты входа, дневной стоп
 - `TestExitProfile` — профиль выхода (`exit_params`) по цене входа: TP/флип (патч A) и SL (патч F, дешёвый вход без стопа, дорогой со стопом)
+- `TestNoiseFloorGate` — порог 0.03 не фиксирует ложный проигрыш без подтверждения Gamma
 - `TestSignalGates` — гейты одиночного `trusted_whale` (фавориты/SELL/нет края)
+- `TestCheapEntryGates` — патч G: лотерейный гейт <0.20, горизонт разрешения, close_at по endDate
+- `TestStateFiles` / `TestReconcile` — патч G: атомарные файлы, карантин битого JSON, сверка филлов и позиций
+- `TestOutcomeQueueRotation` — патч G: ротация очереди сверки, gave_up
 - `TestMarketFilter` — regex фильтр спорта/шума
 - `TestDB` — SQLite roundtrip, дедупликация tx
 - `TestNotifier` — все обязательные поля в алерте
 
 При любом изменении логики скоринга или Engine — добавь тест.
+В тестах не зашивай абсолютные даты «в будущем» — они протухают
+(кейс: `close_at=2026-06-30` в фикстуре сломал тест 1 июля).
 
 ---
 
 ## Python-окружение
 
-Проект использует **общий `.venv`** для всех Antigravity-проектов:
-
-```
-/Users/vitalyn/MyDocuments/00 My Projects/.venv/
-```
-
-**Никогда не создавай локальный `venv/` в папке проекта.** Если нужен новый пакет — устанавливай в общий:
+Исторически проект использовал общий `.venv` всех Antigravity-проектов
+(`/Users/vitalyn/MyDocuments/00 My Projects/.venv/`), но локально его больше
+нет (проверено 2026-07-04). Локальные тесты работают на системном
+`python3` (homebrew 3.14, `httpx`/`dotenv` установлены):
 
 ```bash
-"/Users/vitalyn/MyDocuments/00 My Projects/.venv/bin/pip" install <package>
+PYTHONPATH=. python3 -m unittest tests.test_bot -v
 ```
 
-Затем добавь его в `requirements.txt`.
+**Не создавай локальный `venv/` в папке проекта.** Новый пакет → добавь в
+`requirements.txt`; на сервере он ставится в серверный `~/polymarket-bot/.venv`
+(см. `deploy/install.sh`).
 
 ---
 
@@ -201,15 +209,17 @@ signal_outcomes (
     entry_price REAL, signal_type TEXT,
     wallets TEXT,              -- адреса на стороне сигнала, через запятую
     created_at TEXT,
-    resolved_at TEXT, winner TEXT, won INTEGER  -- NULL пока рынок не разрешён
+    resolved_at TEXT, winner TEXT, won INTEGER,  -- NULL пока рынок не разрешён
+    last_checked TEXT,         -- патч G: ротация очереди сверки
+    check_attempts INTEGER, gave_up INTEGER  -- gave_up=1 → безнадёжен, выбыл из очереди
 )
 ```
 
-**Петля обратной связи:** каждый сигнал пишется в `signal_outcomes` (даже если позиция не открыта — оцениваем кита). `tracker.check_signal_outcomes()` каждые 30 минут сверяет с разрешением рынков; киты с ≥ 5 разрешёнными сигналами и долей правоты < 40% удаляются автоматически (`db.prune_bad_performers`).
+**Петля обратной связи:** каждый сигнал пишется в `signal_outcomes` (даже если позиция не открыта — оцениваем кита). `tracker.check_signal_outcomes()` каждые 30 минут сверяет батч `outcome_check_batch=100` с разрешением рынков (очередь ротируется по `last_checked`, безнадёжные старше `outcome_give_up_days=30` получают `gave_up=1`); киты с ≥ 5 разрешёнными сигналами и долей правоты < 40% удаляются автоматически (`db.prune_bad_performers`).
 
 **Элита:** одиночный сигнал (без консенсуса) даёт только элитный кит — WinRate ≥ 70% и PnL ≥ $10k, инсайдер или leaderboard-кит (`db.get_elite_addresses`). Остальные отслеживаемые — только консенсусом 2+.
 
-**Управление капиталом (`src/tracker.py`):** размер позиции — fractional Kelly `position_size_usd()` (0.25 Келли); кап банкролла зависит от цены входа — 2% обычно, **4% для дешёвых входов** (`< cheap_entry_max=0.35`, см. патч B ниже). Лимиты `entry_blocked()` — максимум 10 позиций, одна на рынок. Дневной стоп `daily_stop_active()` — просадка ≥ 5% за день UTC → пауза входов до завтра (состояние в `data/metrics.json`).
+**Управление капиталом (`src/tracker.py`):** размер позиции — fractional Kelly `position_size_usd()` (0.25 Келли); кап банкролла — 2% на позицию для всех бакетов (патч G: повышенный кап 4% для дешёвых входов ОТМЕНЁН — бакет <0.35 дал −$236 за 19.06–03.07 при неподтверждённой правоте; возвращать выше только когда `signal_outcome_breakdown()` покажет правоту > цены на этом бакете при ≥30 разрешённых). Лимиты `entry_blocked()` — максимум 10 позиций, одна на рынок. Дневной стоп `daily_stop_active()` — просадка ≥ 5% за день UTC → пауза входов до завтра (состояние в `data/metrics.json`).
 
 **Профиль выхода зависит от цены входа** (`exit_params()` в `src/tracker.py`, патч A от 2026-06-19, патч F от 2026-06-24) — TP/флип/SL не фиксированы, а считаются по входу. `exit_params()` возвращает кортеж `(partial_take_delta, partial_take_fraction, take_profit_delta, stop_loss_delta)`, где `stop_loss_delta == None` → стоп выключен:
 - дешёвый лонгшот (вход `< 0.35`): флип **выключен** (`cheap_partial_take_fraction=0`), широкий TP `+0.45`, **стоп выключен** (`cheap_stop_loss_delta=None`, патч F) — едет до разрешения. Дешёвые входы дают мунбэги (×3–×5), флип на +5ц их обрубает, а плоский стоп −15ц выбивает их рыночным шумом до разрешения (вход 0.18 → −15ц это −83% капитала позиции).
@@ -218,11 +228,14 @@ signal_outcomes (
 
 **Патч F (2026-06-24, почему):** анализ paper-торговли 10–24 июня — слив −$89 при том, что 70% сигналов в итоге правы. Деньги терялись на ВЫХОДЕ: 22 стоп-лосса = −$210, почти все на дешёвых входах, выбитых шумом за 15мин–6ч ДО разрешения. Раньше стоп был плоским `−0.15` для всех; теперь зависит от цены входа, как уже было сделано для TP патчем A.
 
-**Гейты одиночного сигнала** (патчи B/C в `execute_trade()`, `src/tracker.py`) — применяются ТОЛЬКО к `signal_type == "trusted_whale"` (одиночный элитный кит); консенсус (`signal_type == "consensus"`) их не проходит, его край в группе, а не в WinRate одного кита:
+**Патч G (2026-07-04, почему):** аудит 19.06–03.07 — слив −$328, из них ~$179 съела бухгалтерская дыра (позиции испарялись при рестартах из-за неатомарной записи), остальное — дешёвые лонгшоты (−$236 закрытых, 10/32 прибыльных, ни одного выигранного разрешения) и 24ч-таймер, рубивший «безстопные» позиции до разрешения. Плюс петля исходов голодала (0 сверок с 15.06). Ответ: `src/state.py` (атомарность+сверка), ротация очереди сверки, `close_at`=endDate для cheap, кап cheap 4%→2%, лотерейный гейт <0.20. Подробный разбор: brain → `retro/2026-07-04.md`.
+
+**Гейты одиночного сигнала** (патчи B/C/G в `execute_trade()`, `src/tracker.py`) — применяются ТОЛЬКО к `signal_type == "trusted_whale"` (одиночный элитный кит); консенсус (`signal_type == "consensus"`) их не проходит, его край в группе, а не в WinRate одного кита:
 - цена входа `≥ single_whale_max_price` (0.50) → скип, фавориты только консенсусом.
+- цена входа `< cheap_consensus_below` (0.20) → скип, лотерейные входы только консенсусом (патч G).
 - `side == "SELL"` и `single_whale_allow_sell=False` (дефолт) → скип — SELL одиночных китов исторически даёт низкую правоту.
 - `skip_when_no_edge=True` (дефолт) и `WinRate кита ≤ цена` → скип вместо ставки минимального размера ($2 в никуда).
 
-Все пороги выше переопределяются через `.env` (см. `.env.example`) — `CHEAP_ENTRY_MAX`, `CHEAP_TAKE_PROFIT_DELTA`, `CHEAP_STOP_LOSS_DELTA` (`none`/`off` = стоп выкл), `EXPENSIVE_STOP_LOSS_DELTA`, `POSITION_MAX_PCT_CHEAP`, `SINGLE_WHALE_MAX_PRICE`, `SINGLE_WHALE_ALLOW_SELL`, `SKIP_WHEN_NO_EDGE`, `KELLY_FRACTION`, `PAPER_START_BALANCE`.
+Все пороги выше переопределяются через `.env` (см. `.env.example`) — `CHEAP_ENTRY_MAX`, `CHEAP_TAKE_PROFIT_DELTA`, `CHEAP_STOP_LOSS_DELTA` (`none`/`off` = стоп выкл), `EXPENSIVE_STOP_LOSS_DELTA`, `POSITION_MAX_PCT_CHEAP`, `SINGLE_WHALE_MAX_PRICE`, `SINGLE_WHALE_ALLOW_SELL`, `SKIP_WHEN_NO_EDGE`, `CHEAP_CONSENSUS_BELOW`, `CHEAP_MAX_HORIZON_DAYS`, `KELLY_FRACTION`, `PAPER_START_BALANCE`.
 
 **Диагностика правоты сигналов** — `db.signal_outcome_breakdown()` (патч E) даёт разбивку правоты по стороне/типу/цене входа; видна и в `scripts/calibration_check.py`, и в ежедневном heartbeat (`maybe_daily_report()`).

@@ -8,23 +8,25 @@
 """
 
 import os
-import json
 import time
 import logging
 import traceback
 from collections import defaultdict, OrderedDict
 from datetime import datetime, timezone, timedelta
 
-from src import api, db
+from src import api, db, state
 from src.config import CONFIG
 from src.engine import FilterEngine
 from src.notifier import Notifier
-from src.trader import place_bet, close_position, get_usdc_balance
+from src.trader import place_bet, close_position, get_usdc_balance, get_paper_fills
 from src.logger import setup_logging
 
 logger = setup_logging(log_file=CONFIG.files.log_file, json_format=False)
 engine = FilterEngine()
 notifier = Notifier()
+
+# Битые файлы состояния — сразу в Telegram, не только в лог (патч G).
+state.set_alert_hook(lambda msg: (notifier.send(msg), notifier.flush()))
 
 os.makedirs(CONFIG.files.log_dir, exist_ok=True)
 os.makedirs("data", exist_ok=True)
@@ -38,18 +40,11 @@ _sent_cache = None
 
 
 def _load_sent():
-    if os.path.exists(CONFIG.files.signals_file):
-        try:
-            with open(CONFIG.files.signals_file) as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    return state.load_json(CONFIG.files.signals_file, dict)
 
 
 def _save_sent(sent):
-    with open(CONFIG.files.signals_file, "w") as f:
-        json.dump(sent, f)
+    state.save_json(CONFIG.files.signals_file, sent, indent=None)
 
 
 def is_duplicate(key, cooldown_hours=12):
@@ -96,18 +91,52 @@ def _within_ttl(v, now, ttl):
 # ============================================================
 
 def load_positions():
-    if os.path.exists(CONFIG.files.positions_file):
-        try:
-            with open(CONFIG.files.positions_file) as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    return state.load_json(CONFIG.files.positions_file, dict)
 
 
 def save_positions(pos):
-    with open(CONFIG.files.positions_file, "w") as f:
-        json.dump(pos, f, indent=2)
+    state.save_json(CONFIG.files.positions_file, pos)
+
+
+def reconcile_report(fills, positions):
+    """
+    Патч G: сверка ленты paper-филлов с open_positions.json.
+    Возвращает текст расхождения или None. Не чинит сам — только сигналит:
+    «куплено, но не отслеживается» = деньги списаны, а позиции-призраки
+    бот больше не видит (так за 19–25 июня молча пропало ~$179).
+    """
+    net = defaultdict(float)
+    for f in fills:
+        sign = 1.0 if f.get("side") == "BUY" else -1.0
+        net[f.get("token_id", "")] += sign * float(f.get("size", 0))
+    outstanding = {t: s for t, s in net.items() if t and s > 0.01}
+
+    ghosts = sorted(t for t in outstanding if t not in positions)
+    orphans = sorted(t for t in positions if t not in outstanding)
+    if not ghosts and not orphans:
+        return None
+    lines = ["🚨 <b>Сверка состояния: филлы и позиции расходятся!</b>"]
+    if ghosts:
+        lines.append(
+            f"Куплены по филлам, но НЕ отслеживаются ({len(ghosts)}): "
+            + ", ".join(f"<code>{t[:14]}…</code>" for t in ghosts))
+    if orphans:
+        lines.append(
+            f"Отслеживаются без филлов ({len(orphans)}): "
+            + ", ".join(f"<code>{t[:14]}…</code>" for t in orphans))
+    lines.append("Разбери вручную: data/paper_fills.json vs data/open_positions.json")
+    return "\n".join(lines)
+
+
+def reconcile_state_on_start():
+    """Сверка при старте (только paper: в live источник правды — кошелёк)."""
+    if not CONFIG.trading.paper_mode:
+        return
+    report = reconcile_report(get_paper_fills(), load_positions())
+    if report:
+        logger.critical(report)
+        notifier.send(report)
+        notifier.flush()
 
 
 def committed_value(positions: dict) -> float:
@@ -391,18 +420,11 @@ def entry_blocked(positions, cond_id):
 
 
 def _load_metrics():
-    if os.path.exists(CONFIG.files.metrics_file):
-        try:
-            with open(CONFIG.files.metrics_file) as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    return state.load_json(CONFIG.files.metrics_file, dict)
 
 
 def _save_metrics(m):
-    with open(CONFIG.files.metrics_file, "w") as f:
-        json.dump(m, f, indent=2)
+    state.save_json(CONFIG.files.metrics_file, m)
 
 
 def daily_stop_active(balance):
@@ -478,6 +500,13 @@ def execute_trade(signal, positions, whale_stats=None):
         if price >= CONFIG.trading.single_whale_max_price:
             return (f"⏭ Пропуск (одиночный кит, цена {price:.2f} ≥ "
                     f"{CONFIG.trading.single_whale_max_price} — фавориты только консенсусом)")
+        # Патч G: лотерейные входы (<0.20) — только консенсусом. Одиночные
+        # киты на них дали основной убыток 19.06–03.07 (бакет <0.35: 10/32
+        # прибыльных, −$236), а их глобальный WinRate заработан на фаворитах
+        # и о правоте на лонгшотах ничего не говорит.
+        if price < CONFIG.trading.cheap_consensus_below:
+            return (f"⏭ Пропуск (одиночный кит, лотерейный вход {price:.2f} < "
+                    f"{CONFIG.trading.cheap_consensus_below} — только консенсусом)")
         if CONFIG.trading.skip_when_no_edge:
             best_wr = max((w.get("winrate") or 0 for w in (whale_stats or [])), default=0)
             if best_wr <= price:
@@ -488,6 +517,22 @@ def execute_trade(signal, positions, whale_stats=None):
     ref_price = whale_price if signal["side"] == "BUY" else 1.0 - whale_price
     if price - ref_price > CONFIG.trading.max_entry_slippage:
         return f"⏭ Пропуск (поезд ушёл: кит входил ~{ref_price:.3f}, сейчас {price:.3f})"
+
+    # Патч G: у дешёвого лонгшота стоп выключен (патч F) — он должен дожить
+    # до РАЗРЕШЕНИЯ, а 24ч-таймер закрывал его по шумовой цене (12 «ВРЕМЯ
+    # ВЫШЛО» за 19.06–03.07). Поэтому close_at = endDate рынка; рынок дальше
+    # горизонта — не входим вовсе. Для середины/фаворитов таймер прежний.
+    now = datetime.now(timezone.utc)
+    close_at = now + timedelta(hours=CONFIG.trading.position_hold_hours)
+    if price < CONFIG.trading.cheap_entry_max:
+        end = api.get_market_end_date(cond_id)
+        if end is not None:
+            days_left = (end - now).days
+            if days_left > CONFIG.trading.cheap_max_horizon_days:
+                return (f"⏭ Пропуск (лонгшот, разрешение через {days_left} дн. > "
+                        f"{CONFIG.trading.cheap_max_horizon_days} — таймер убьёт позицию раньше)")
+            # +2ч буфера: даём manage_positions закрыть по факту разрешения (1.0/0.0)
+            close_at = max(end, now) + timedelta(hours=2)
 
     balance = get_usdc_balance()
     if balance < 1.0:
@@ -510,8 +555,8 @@ def execute_trade(signal, positions, whale_stats=None):
         "entry_price": price,
         "size_usd": round(tokens * price, 2),
         "tokens": round(tokens, 4),
-        "opened_at": datetime.now(timezone.utc).isoformat(),
-        "close_at": (datetime.now(timezone.utc) + timedelta(hours=CONFIG.trading.position_hold_hours)).isoformat(),
+        "opened_at": now.isoformat(),
+        "close_at": close_at.isoformat(),
     }
     save_positions(positions)
     return f"✅ {mode}: BUY {tokens:.1f} шеров «{bought_outcome}» @ {price:.3f} (${tokens * price:.2f})"
@@ -587,22 +632,46 @@ def check_signal_outcomes():
     Сверяет записанные сигналы с разрешением рынков (был ли кит прав)
     и удаляет китов со статистически убыточными сигналами.
     Возвращает список удалённых адресов.
+
+    Патч G: очередь ротируется (давно не проверенные — первыми), проверки
+    отмечаются в БД, безнадёжные сигналы (без cond_id или старше
+    outcome_give_up_days) помечаются gave_up и выбывают из очереди —
+    раньше 100 старейших неразрешаемых закупоривали её навсегда.
     """
-    unresolved = db.get_unresolved_outcomes()
+    unresolved = db.get_unresolved_outcomes(limit=CONFIG.engine.outcome_check_batch)
     if not unresolved:
         return []
+    give_up_before = (datetime.now(timezone.utc)
+                      - timedelta(days=CONFIG.engine.outcome_give_up_days))
     resolved_n = 0
+    checked_ids, gave_up_ids = [], []
     for o in unresolved:
+        checked_ids.append(o["id"])
         if not o.get("cond_id"):
+            gave_up_ids.append(o["id"])
             continue
         winner = api.get_market_resolution(o["cond_id"])
         if winner is None:
-            continue  # рынок ещё не разрешён
+            # Рынок ещё не разрешён. Слишком старый — признаём безнадёжным.
+            try:
+                created = datetime.fromisoformat(o.get("created_at") or "")
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if created < give_up_before:
+                    gave_up_ids.append(o["id"])
+            except ValueError:
+                gave_up_ids.append(o["id"])
+            continue
         bet = (o.get("outcome") or "").lower()
         # BUY → кит прав, если его исход выиграл; SELL → если исход проиграл
         won = (winner == bet) if o.get("side") == "BUY" else (winner != bet)
         db.mark_outcome_resolved(o["id"], winner, won)
         resolved_n += 1
+
+    db.touch_outcomes_checked(checked_ids)
+    if gave_up_ids:
+        db.mark_outcomes_gave_up(gave_up_ids)
+        logger.info(f"Исходы сигналов: {len(gave_up_ids)} помечены безнадёжными (gave_up)")
 
     if not resolved_n:
         return []
@@ -629,6 +698,7 @@ def run():
     print("=" * 60)
 
     db.init_db()
+    reconcile_state_on_start()  # патч G: филлы vs позиции, расхождение → алерт
     tracked = db.get_tracked_addresses()
     elite = _load_elite()
     if not tracked:

@@ -8,7 +8,6 @@
   • /trades       — поле `size` это КОЛИЧЕСТВО ШЕРОВ, не USDC. Notional = size * price.
   • /positions    — отдаёт готовые realizedPnl / cashPnl по каждой позиции кошелька.
   • /value        — текущая стоимость портфеля кошелька.
-  • /holders      — топ-холдеры рынка (вкладка "Top Holders" из требований).
 """
 
 import time
@@ -92,22 +91,6 @@ def get_portfolio_value(user: str) -> float:
     return 0.0
 
 
-def get_holders(condition_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-    """
-    Топ-холдеры рынка (вкладка "Top Holders").
-    Возвращает плоский список холдеров со всех outcome-токенов рынка.
-    """
-    data = _get(f"{CONFIG.api.data_api}/holders",
-                {"market": condition_id, "limit": limit},
-                timeout=CONFIG.timeout.holders_timeout)
-    holders: List[Dict[str, Any]] = []
-    if isinstance(data, list):
-        for token_group in data:
-            for h in token_group.get("holders", []):
-                holders.append(h)
-    return holders
-
-
 def get_leaderboard(rank_type: str = "pnl", window: str = "30d",
                     limit: int = 50) -> List[Dict[str, Any]]:
     """
@@ -151,27 +134,6 @@ def get_first_trade_ts(user: str, max_pages: int = 4) -> Optional[int]:
 # ============================================================
 #  Gamma API (метаданные и разрешение рынков)
 # ============================================================
-
-def get_liquid_markets(limit: int = 40, min_liquidity: float = 500_000.0) -> List[Dict[str, Any]]:
-    """Активные рынки с высокой ликвидностью, отсортированные по объёму (для скаута)."""
-    data = _get(f"{CONFIG.api.gamma_api}/markets",
-                {"active": "true", "closed": "false", "limit": 200,
-                 "order": "volumeNum", "ascending": "false"},
-                timeout=CONFIG.timeout.default_timeout)
-    if not isinstance(data, list):
-        return []
-    out = []
-    for m in data:
-        try:
-            liq = float(m.get("liquidity", 0) or 0)
-        except (TypeError, ValueError):
-            liq = 0.0
-        if liq >= min_liquidity:
-            out.append(m)
-        if len(out) >= limit:
-            break
-    return out
-
 
 def get_market_resolution(condition_id: str) -> Optional[str]:
     """Возвращает выигравший outcome (lower) если рынок фактически разрешён, иначе None.
@@ -220,6 +182,26 @@ def get_market_resolution(condition_id: str) -> Optional[str]:
         except (ValueError, TypeError):
             pass
     return None
+
+
+def get_market_end_date(condition_id: str) -> Optional[datetime]:
+    """
+    endDate рынка из Gamma (aware UTC datetime) или None.
+    Патч G: дешёвый лонгшот без стопа держим до разрешения рынка,
+    поэтому close_at позиции привязывается к endDate, а не к 24ч-таймеру.
+    """
+    data = _get(f"{CONFIG.api.gamma_api}/markets", {"condition_ids": condition_id},
+                timeout=CONFIG.timeout.default_timeout)
+    if not isinstance(data, list) or not data:
+        return None
+    end = data[0].get("endDate")
+    if not end:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
 
 
 # ============================================================

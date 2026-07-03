@@ -52,18 +52,24 @@ CREATE TABLE IF NOT EXISTS tx_history (
 -- Исходы сигналов: был ли кит прав. Основа авточистки плохих китов
 -- и оценки качества стратегии (Фаза 2).
 CREATE TABLE IF NOT EXISTS signal_outcomes (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    cond_id       TEXT,
-    market_title  TEXT,
-    side          TEXT,            -- BUY / SELL (направление сигнала)
-    outcome       TEXT,            -- consensus_outcome сигнала (lower)
-    entry_price   REAL,            -- цена на момент сигнала
-    signal_type   TEXT,            -- trusted_whale / consensus
-    wallets       TEXT,            -- адреса на стороне сигнала, через запятую
-    created_at    TEXT,
-    resolved_at   TEXT,            -- NULL пока рынок не разрешён
-    winner        TEXT,            -- выигравший outcome (lower)
-    won           INTEGER          -- 1 = кит был прав, 0 = нет, NULL = не разрешён
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    cond_id        TEXT,
+    market_title   TEXT,
+    side           TEXT,            -- BUY / SELL (направление сигнала)
+    outcome        TEXT,            -- consensus_outcome сигнала (lower)
+    entry_price    REAL,            -- цена на момент сигнала
+    signal_type    TEXT,            -- trusted_whale / consensus
+    wallets        TEXT,            -- адреса на стороне сигнала, через запятую
+    created_at     TEXT,
+    resolved_at    TEXT,            -- NULL пока рынок не разрешён
+    winner         TEXT,            -- выигравший outcome (lower)
+    won            INTEGER,         -- 1 = кит был прав, 0 = нет, NULL = не разрешён
+    -- Патч G: справедливая ротация очереди сверки. Раньше выборка была
+    -- ORDER BY created_at LIMIT 100 — очередь вечно жевала 100 старейших
+    -- неразрешаемых сигналов и не доходила до свежих (0 сверок за 2 недели).
+    last_checked   TEXT,             -- когда последний раз спрашивали Gamma
+    check_attempts INTEGER DEFAULT 0,
+    gave_up        INTEGER DEFAULT 0 -- 1 = безнадёжен (нет cond_id / слишком стар)
 );
 
 CREATE INDEX IF NOT EXISTS idx_whales_insider ON whales(is_insider);
@@ -86,13 +92,21 @@ def _conn():
 
 def init_db() -> None:
     """Создаёт таблицы если их нет + миграции существующей БД."""
+    migrations = [
+        # Фаза 2
+        "ALTER TABLE whales ADD COLUMN lifetime_pnl REAL DEFAULT 0",
+        # Патч G: ротация очереди сверки исходов
+        "ALTER TABLE signal_outcomes ADD COLUMN last_checked TEXT",
+        "ALTER TABLE signal_outcomes ADD COLUMN check_attempts INTEGER DEFAULT 0",
+        "ALTER TABLE signal_outcomes ADD COLUMN gave_up INTEGER DEFAULT 0",
+    ]
     with _conn() as con:
         con.executescript(SCHEMA)
-        # Миграция: lifetime_pnl появился в Фазе 2
-        try:
-            con.execute("ALTER TABLE whales ADD COLUMN lifetime_pnl REAL DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # колонка уже есть
+        for sql in migrations:
+            try:
+                con.execute(sql)
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
     logger.info(f"DB готова: {CONFIG.files.db_path}")
 
 
@@ -305,10 +319,17 @@ def record_signal_outcome(signal: Dict[str, Any], wallets: List[str],
 
 
 def get_unresolved_outcomes(limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    Патч G: очередь сверки с честной ротацией — сначала давно не проверенные
+    (непроверенные вообще — первыми, среди них свежие вперёд), безнадёжные
+    (gave_up) не занимают место. Раньше `ORDER BY created_at LIMIT N` вечно
+    возвращал одни и те же N старейших неразрешаемых → петля голодала.
+    """
     with _conn() as con:
         rows = con.execute(
-            "SELECT * FROM signal_outcomes WHERE resolved_at IS NULL "
-            "ORDER BY created_at LIMIT ?",
+            "SELECT * FROM signal_outcomes "
+            "WHERE resolved_at IS NULL AND COALESCE(gave_up, 0) = 0 "
+            "ORDER BY COALESCE(last_checked, '') ASC, id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -319,6 +340,31 @@ def mark_outcome_resolved(outcome_id: int, winner: str, won: bool) -> None:
         con.execute(
             "UPDATE signal_outcomes SET resolved_at = ?, winner = ?, won = ? WHERE id = ?",
             (_now(), winner, 1 if won else 0, outcome_id),
+        )
+
+
+def touch_outcomes_checked(ids: List[int]) -> None:
+    """Отметить, что сигналы только что сверялись (для ротации очереди)."""
+    if not ids:
+        return
+    marks = ",".join("?" for _ in ids)
+    with _conn() as con:
+        con.execute(
+            f"UPDATE signal_outcomes SET last_checked = ?, "
+            f"check_attempts = COALESCE(check_attempts, 0) + 1 WHERE id IN ({marks})",
+            [_now(), *ids],
+        )
+
+
+def mark_outcomes_gave_up(ids: List[int]) -> None:
+    """Пометить сигналы безнадёжными — рынок так и не разрешился за отведённый срок."""
+    if not ids:
+        return
+    marks = ",".join("?" for _ in ids)
+    with _conn() as con:
+        con.execute(
+            f"UPDATE signal_outcomes SET gave_up = 1 WHERE id IN ({marks})",
+            ids,
         )
 
 

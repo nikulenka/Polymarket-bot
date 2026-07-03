@@ -78,5 +78,6 @@ cd ~/polymarket-bot && git pull && sudo systemctl restart polymarket-tracker
 
 ## Локальный запуск (macOS) — без изменений
 
-На маке всё работает как раньше: `./run.sh` + cron на `update_daily.sh`.
+На маке всё работает как раньше: `./run.sh` (трекер) и
+`PYTHONPATH=. python3 -m src.scout` (рескан китов вручную).
 Папка `deploy/` — только для Linux-сервера.

@@ -136,6 +136,10 @@ class EngineConfig:
     elite_min_pnl: float = 10_000.0
     # Как часто проверять разрешение рынков по записанным сигналам (сек)
     outcome_check_interval: int = 1800
+    # Патч G: размер батча сверки (очередь ротируется: давно не проверенные
+    # первыми) и срок, после которого неразрешённый сигнал безнадёжен (gave_up).
+    outcome_check_batch: int = 100
+    outcome_give_up_days: int = 30
 
 
 @dataclass
@@ -190,10 +194,19 @@ class TradingConfig:
     cheap_stop_loss_delta: float | None = None     # None = без стопа для дешёвых входов
     expensive_stop_loss_delta: float = -0.15
 
-    # --- Патч B: повышенный кап для дешёвых входов (асимметричный край) ---
-    # Корзина <0.5 дала +$147, корзина 0.5–0.7 дала −$16: концентрируем капитал
-    # там, где работает асимметрия.
-    position_max_pct_cheap: float = 0.04
+    # --- Патч G (2026-07-04): повышенный кап дешёвых входов ОТМЕНЁН ---
+    # Патч B давал бакету <0.35 кап 4% («асимметричный край»), но окно
+    # 19.06–03.07 показало: бакет дал −$236 при 10/32 прибыльных и ни одного
+    # выигранного разрешения. Правота китов на лонгшотах петлёй исходов пока
+    # не подтверждена → кап как у всех (2%). Вернуть выше — только когда
+    # signal_outcome_breakdown() покажет право́ту > цены на этом бакете.
+    position_max_pct_cheap: float = 0.02
+    # Совсем дешёвые (лотерейные) входы — только консенсусом 2+ китов:
+    # одиночный кит с глобальным WinRate 80% ничего не говорит о рынке за 15ц.
+    cheap_consensus_below: float = 0.20
+    # Дешёвый лонгшот без стопа держим до разрешения (close_at = endDate рынка),
+    # но не дольше горизонта: рынок с разрешением дальше N дней — пропуск входа.
+    cheap_max_horizon_days: int = 7
 
     # --- Патчи B/C: ограничения ОДИНОЧНОГО сигнала trusted_whale ---
     # Консенсус (2+ кошелька) всегда проходит — его край в группе, а не в
@@ -245,7 +258,6 @@ class TimeoutConfig:
     price_timeout: int = 5
     telegram_timeout: int = 5
     positions_timeout: int = 15
-    holders_timeout: int = 15
 
 
 @dataclass
@@ -346,6 +358,10 @@ def load_config() -> BotConfig:
     config.trading.single_whale_max_price = _env_float("SINGLE_WHALE_MAX_PRICE", config.trading.single_whale_max_price)
     config.trading.single_whale_allow_sell = _env_bool("SINGLE_WHALE_ALLOW_SELL", config.trading.single_whale_allow_sell)
     config.trading.skip_when_no_edge = _env_bool("SKIP_WHEN_NO_EDGE", config.trading.skip_when_no_edge)
+
+    # Патч G: гейты дешёвых входов
+    config.trading.cheap_consensus_below = _env_float("CHEAP_CONSENSUS_BELOW", config.trading.cheap_consensus_below)
+    config.trading.cheap_max_horizon_days = _env_int("CHEAP_MAX_HORIZON_DAYS", config.trading.cheap_max_horizon_days)
 
     return config
 

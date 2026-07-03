@@ -49,7 +49,8 @@
 | [src/config.py](src/config.py) | Вся конфигурация (пороги, таймауты, режимы) |
 | [src/cache.py](src/cache.py) | TelegramBatcher (батчинг сообщений) |
 | [src/logger.py](src/logger.py) | JSON + plain логирование с ротацией |
-| [src/get_chat_id.py](src/get_chat_id.py) | Утилита: узнать TELEGRAM_CHAT_ID |
+| [src/state.py](src/state.py) | Атомарные JSON-файлы состояния (патч G) |
+| [scripts/get_chat_id.py](scripts/get_chat_id.py) | Утилита: узнать TELEGRAM_CHAT_ID |
 
 ---
 
@@ -86,11 +87,8 @@ PYTHONPATH=. python3 -m src.scout
 PYTHONPATH=. python3 -m src.tracker
 ```
 
-**Ежедневное обновление** (рескан китов + рестарт трекера):
-
-```bash
-./update_daily.sh              # повесить на cron
-```
+**Ежедневное обновление китов** — на сервере это делает systemd-таймер
+(`deploy/polymarket-scout.timer`); локально: `PYTHONPATH=. python3 -m src.scout`.
 
 ---
 
@@ -139,12 +137,13 @@ PYTHONPATH=. python3 -m unittest tests.test_bot -v
 
 ```
 src/            основные модули
+scripts/        утилиты (get_chat_id, calibration_check)
 tests/          mock-тесты
 data/           рантайм-данные (gitignored: *.db *.csv *.json)
 logs/           логи (gitignored)
 docs/           требования и документация
-run.sh          запуск трекера в фоне
-update_daily.sh ежедневный рескан китов + рестарт
+deploy/         systemd-юниты и install.sh для сервера
+run.sh          запуск трекера в фоне (локально; на сервере — systemd)
 .env.example    шаблон переменных окружения
 ```
 ## Шпаргалка по управлению:
